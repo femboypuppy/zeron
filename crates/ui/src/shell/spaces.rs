@@ -11,10 +11,12 @@
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use gpui::{FocusHandle, Window};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use zeron_proto::{
-    AgentProject, AgentProjectListing, AgentProjectSource, ChatIndicator, Device, DriveEntry,
-    DriveListing, FolderListing, HarnessId, Space,
+    AgentPreviewRole, AgentProject, AgentProjectListing, AgentProjectSource, AgentSession,
+    AgentSessionListing, AgentSessionPreview, ChatIndicator, Device, DriveEntry, DriveListing,
+    FolderListing, HarnessId, ImportedAgentSession, Space,
 };
 
 /// Promote the user's ordered pins above the untouched activity projection.
@@ -2002,6 +2004,50 @@ enum ProjectStep {
     Locations,
     Folders,
     Import,
+    /// One imported project's conversations, with a preview of the
+    /// highlighted one.
+    Sessions,
+}
+
+/// Whether the agent's conversations (not just its project folders) can be
+/// imported — the engine's `ListAgentSessions` sources.
+fn imports_conversations(harness: HarnessId) -> bool {
+    matches!(
+        harness,
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Opencode
+    )
+}
+
+/// A loaded conversation preview, render-ready: held in an `Rc`, so a frame
+/// clones a pointer, not the transcript.
+struct SessionPreview {
+    omitted: usize,
+    messages: Vec<PreviewLine>,
+}
+
+struct PreviewLine {
+    user: bool,
+    text: SharedString,
+    tools: Vec<SharedString>,
+    at: Option<chrono::DateTime<Utc>>,
+}
+
+impl From<AgentSessionPreview> for SessionPreview {
+    fn from(preview: AgentSessionPreview) -> Self {
+        Self {
+            omitted: preview.omitted,
+            messages: preview
+                .messages
+                .into_iter()
+                .map(|message| PreviewLine {
+                    user: message.role == AgentPreviewRole::User,
+                    text: message.text.into(),
+                    tools: message.tools.into_iter().map(SharedString::from).collect(),
+                    at: message.at,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// One row of the Locations step: a browse root, or an agent to import from.
@@ -2069,6 +2115,14 @@ pub(super) struct AddSpaceFlow {
     agent_projects: Loadable<Vec<AgentProjectSource>>,
     /// The agent whose projects the Import step lists.
     import_source: Option<HarnessId>,
+    /// The project whose conversations the Sessions step lists.
+    import_project: Option<AgentProject>,
+    sessions: Loadable<Vec<AgentSession>>,
+    /// Conversation previews by session id, loaded as the highlight moves.
+    previews: HashMap<String, Loadable<Rc<SessionPreview>>>,
+    /// The session the preview pane last showed (a change re-scrolls it).
+    preview_for: Option<String>,
+    preview_scroll: gpui::ScrollHandle,
     /// Requested browser path (`None` = the device's default, i.e. home).
     browser_path: Option<String>,
     /// The device's home (the path a `None` browse resolved to) — breadcrumbs
@@ -2080,6 +2134,9 @@ pub(super) struct AddSpaceFlow {
     browser_repo: bool,
     /// Keyboard highlight within the current step’s filtered rows.
     active: usize,
+    /// Highlight to land on after a step change's programmatic query clear,
+    /// whose `Edited` event would otherwise reset it to the first row.
+    restore_active: Option<usize>,
     submit_busy: bool,
     error: Option<SharedString>,
     /// Tracked on the card (`track_focus`) — puts the card on the keyboard
@@ -2093,8 +2150,20 @@ pub(super) struct AddSpaceFlow {
     load_task: Option<Task<()>>,
     drives_task: Option<Task<()>>,
     agent_projects_task: Option<Task<()>>,
+    sessions_task: Option<Task<()>>,
     submit_task: Option<Task<()>>,
     _search_events: Subscription,
+}
+
+impl AddSpaceFlow {
+    /// Leave the Sessions step's state behind (its listing, previews, task).
+    fn clear_sessions(&mut self) {
+        self.import_project = None;
+        self.sessions = Loadable::Idle;
+        self.sessions_task = None;
+        self.previews.clear();
+        self.preview_for = None;
+    }
 }
 
 /// Segment-aware "is `path` at or under `base`" (`/media/a` is not under
@@ -5070,9 +5139,18 @@ impl Shell {
                     return;
                 }
                 if let Some(flow) = this.add_space.as_mut() {
-                    flow.active = 0;
-                    flow.list_scroll.set_offset(gpui::Point::default());
+                    match flow.restore_active.take() {
+                        Some(active) => {
+                            flow.active = active;
+                            flow.list_scroll.scroll_to_item(active);
+                        }
+                        None => {
+                            flow.active = 0;
+                            flow.list_scroll.set_offset(gpui::Point::default());
+                        }
+                    }
                 }
+                this.add_space_ensure_preview(cx);
                 cx.notify();
             }
         });
@@ -5085,10 +5163,16 @@ impl Shell {
             drives: Loadable::Idle,
             agent_projects: Loadable::Idle,
             import_source: None,
+            import_project: None,
+            sessions: Loadable::Idle,
+            previews: HashMap::new(),
+            preview_for: None,
+            preview_scroll: gpui::ScrollHandle::new(),
             browser_path: None,
             home: None,
             browser_repo: false,
             active: 0,
+            restore_active: None,
             submit_busy: false,
             error: None,
             focus: cx.focus_handle(),
@@ -5097,6 +5181,7 @@ impl Shell {
             load_task: None,
             drives_task: None,
             agent_projects_task: None,
+            sessions_task: None,
             submit_task: None,
             _search_events: search_events,
         });
@@ -5120,6 +5205,7 @@ impl Shell {
         flow.drives = Loadable::Idle;
         flow.agent_projects = Loadable::Idle;
         flow.import_source = None;
+        flow.clear_sessions();
         flow.browser_path = None;
         flow.home = None;
         flow.browser_repo = false;
@@ -5167,6 +5253,7 @@ impl Shell {
         flow.browser_path = None;
         flow.location = None;
         flow.import_source = None;
+        flow.clear_sessions();
         flow.browser_repo = false;
         flow.active = 0;
         flow.error = None;
@@ -5351,6 +5438,400 @@ impl Shell {
         }));
     }
 
+    /// RPC params addressed to the flow's device: `targetDeviceId` only when
+    /// it isn't this one (local calls skip the relay).
+    fn add_space_device_params(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
+        let mut params = serde_json::Map::new();
+        let local = self.state.read(cx).local_device_id.clone();
+        if let Some(target) = self
+            .add_space
+            .as_ref()
+            .and_then(|f| f.device.as_ref())
+            .map(|d| d.id.clone())
+            && local.as_deref() != Some(target.as_str())
+        {
+            params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+        }
+        params
+    }
+
+    /// Open a project row of the Import step: its conversations when the
+    /// agent's can be imported, else add the folder as a project.
+    fn add_space_open_import_row(&mut self, project: AgentProject, cx: &mut Context<Self>) {
+        let source = self.add_space.as_ref().and_then(|f| f.import_source);
+        if source.is_some_and(imports_conversations) {
+            self.add_space_goto_sessions(project, cx);
+        } else {
+            self.import_agent_project(project, cx);
+        }
+    }
+
+    /// List the project's conversations (ListAgentSessions on its device).
+    fn add_space_goto_sessions(&mut self, project: AgentProject, cx: &mut Context<Self>) {
+        let engine = self.state.read(cx).engine().cloned();
+        let mut params = self.add_space_device_params(cx);
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        let Some(harness) = flow.import_source else {
+            return;
+        };
+        flow.clear_sessions();
+        flow.focus_pending = true;
+        flow.step = ProjectStep::Sessions;
+        flow.import_project = Some(project.clone());
+        flow.sessions = Loadable::Loading;
+        flow.active = 0;
+        flow.error = None;
+        flow.list_scroll.set_offset(gpui::Point::default());
+        let search = flow.search.clone();
+        search.update(cx, |input, cx| {
+            input.set_placeholder("Search conversations…", cx);
+            input.set_text("", cx);
+        });
+        let Some(engine) = engine else {
+            if let Some(flow) = self.add_space.as_mut() {
+                flow.sessions = Loadable::Error("Device is not connected".into());
+            }
+            cx.notify();
+            return;
+        };
+        params.insert("harness".into(), serde_json::json!(harness));
+        params.insert("path".into(), serde_json::Value::String(project.path));
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::LIST_AGENT_SESSIONS,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(flow) = shell.add_space.as_mut() {
+                    flow.sessions = match result {
+                        Ok(value) => match serde_json::from_value::<AgentSessionListing>(value) {
+                            Ok(listing) => Loadable::Ready(listing.sessions),
+                            Err(err) => Loadable::Error(err.to_string()),
+                        },
+                        Err(err) => Loadable::Error(err.to_string()),
+                    };
+                }
+                shell.add_space_ensure_preview(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.sessions_task = Some(task);
+        }
+        cx.notify();
+    }
+
+    /// Back from the conversations to the agent's projects, highlighting the
+    /// project we came from.
+    fn add_space_back_to_import(&mut self, cx: &mut Context<Self>) {
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        let project = flow.import_project.clone();
+        flow.clear_sessions();
+        flow.focus_pending = true;
+        flow.step = ProjectStep::Import;
+        flow.error = None;
+        let search = flow.search.clone();
+        search.update(cx, |input, cx| {
+            input.set_placeholder("Search projects…", cx);
+            input.set_text("", cx);
+        });
+        let active = project
+            .and_then(|project| {
+                self.add_space_import_rows(cx)
+                    .iter()
+                    .position(|p| p.path == project.path)
+            })
+            .unwrap_or(0);
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.active = active;
+            flow.restore_active = Some(active);
+        }
+        cx.notify();
+    }
+
+    /// The Sessions step's conversations filtered by the query (by title).
+    fn add_space_session_rows(&self, cx: &App) -> Vec<AgentSession> {
+        let Some(flow) = self.add_space.as_ref() else {
+            return Vec::new();
+        };
+        if flow.step != ProjectStep::Sessions {
+            return Vec::new();
+        }
+        let Some(sessions) = flow.sessions.ready() else {
+            return Vec::new();
+        };
+        let titles: Vec<&str> = sessions.iter().map(|s| s.title.as_str()).collect();
+        popover::filter_indices(flow.search.read(cx).text(), &titles)
+            .into_iter()
+            .map(|ix| sessions[ix].clone())
+            .collect()
+    }
+
+    /// Load the highlighted conversation's preview (once per session) and
+    /// scroll the pane to its latest messages when the highlight changes.
+    fn add_space_ensure_preview(&mut self, cx: &mut Context<Self>) {
+        let rows = self.add_space_session_rows(cx);
+        let engine = self.state.read(cx).engine().cloned();
+        let mut params = self.add_space_device_params(cx);
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        let Some(session) = rows.get(flow.active.min(rows.len().saturating_sub(1))) else {
+            return;
+        };
+        if flow.preview_for.as_deref() != Some(session.id.as_str()) {
+            flow.preview_for = Some(session.id.clone());
+            flow.preview_scroll.scroll_to_bottom();
+        }
+        let (Some(harness), Some(engine)) = (flow.import_source, engine) else {
+            return;
+        };
+        if flow.previews.contains_key(&session.id) {
+            return;
+        }
+        let session_id = session.id.clone();
+        flow.previews.insert(session_id.clone(), Loadable::Loading);
+        params.insert("harness".into(), serde_json::json!(harness));
+        params.insert(
+            "sessionId".into(),
+            serde_json::Value::String(session_id.clone()),
+        );
+        // Detached: moving the highlight must not strand a preview in Loading.
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::PREVIEW_AGENT_SESSION,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(flow) = shell.add_space.as_mut()
+                    && flow.previews.contains_key(&session_id)
+                {
+                    let preview = match result {
+                        Ok(value) => match serde_json::from_value::<AgentSessionPreview>(value) {
+                            Ok(preview) => Loadable::Ready(Rc::new(SessionPreview::from(preview))),
+                            Err(err) => Loadable::Error(err.to_string()),
+                        },
+                        Err(err) => Loadable::Error(err.to_string()),
+                    };
+                    flow.previews.insert(session_id.clone(), preview);
+                    if flow.preview_for.as_deref() == Some(session_id.as_str()) {
+                        flow.preview_scroll.scroll_to_bottom();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Mouse hover moves the highlight (and so the preview) in the Sessions step.
+    fn add_space_hover_session(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        if flow.step != ProjectStep::Sessions || flow.active == ix {
+            return;
+        }
+        flow.active = ix;
+        self.add_space_ensure_preview(cx);
+        cx.notify();
+    }
+
+    /// The chat an earlier import made for this conversation, if any.
+    fn imported_chat(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        harness: HarnessId,
+        cx: &App,
+    ) -> Option<(String, Option<String>)> {
+        self.state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| {
+                chat.device_id == device_id
+                    && chat.harness_session_id.as_deref() == Some(session_id)
+                    && chat.config.as_ref().is_some_and(|c| c.harness == harness)
+            })
+            .map(|chat| (chat.id.clone(), chat.space_id.clone()))
+    }
+
+    /// Open an imported chat, following its project like `land_in_space`.
+    fn land_in_imported_chat(
+        &mut self,
+        space_id: Option<String>,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_space = None;
+        if let Some(space_id) = space_id.filter(|id| !id.is_empty()) {
+            if self.settings.space_filter.is_some() {
+                self.settings.space_filter = Some(space_id.clone());
+            }
+            self.settings.last_space_id = Some(space_id);
+            self.schedule_save(cx);
+        }
+        self.open_chat(chat_id, cx);
+    }
+
+    /// Import one conversation (ImportAgentSession on its device) and open
+    /// the chat; an already-imported conversation just opens.
+    fn import_agent_session(&mut self, session: AgentSession, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let mut params = self.add_space_device_params(cx);
+        let Some(flow) = self.add_space.as_ref() else {
+            return;
+        };
+        if flow.submit_busy {
+            return;
+        }
+        let (Some(harness), Some(device)) = (flow.import_source, flow.device.clone()) else {
+            return;
+        };
+        if let Some((chat_id, space_id)) = self.imported_chat(&device.id, &session.id, harness, cx)
+        {
+            self.land_in_imported_chat(space_id, chat_id, cx);
+            return;
+        }
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.submit_busy = true;
+            flow.error = None;
+        }
+        params.insert("harness".into(), serde_json::json!(harness));
+        params.insert("sessionId".into(), serde_json::Value::String(session.id));
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::IMPORT_AGENT_SESSION,
+                    serde_json::Value::Object(params),
+                )
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<ImportedAgentSession>(value)
+                        .map_err(|err| err.to_string())
+                });
+            this.update(cx, |shell, cx| {
+                match result {
+                    Ok(imported) => {
+                        shell.land_in_imported_chat(Some(imported.space_id), imported.chat_id, cx)
+                    }
+                    Err(err) => {
+                        if let Some(flow) = shell.add_space.as_mut() {
+                            flow.submit_busy = false;
+                            flow.error = Some(format!("Could not import: {err}").into());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.submit_task = Some(task);
+        }
+        cx.notify();
+    }
+
+    /// Import every listed (query-filtered) conversation not imported yet,
+    /// then open the project.
+    fn import_all_agent_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let base_params = self.add_space_device_params(cx);
+        let Some(flow) = self.add_space.as_ref() else {
+            return;
+        };
+        if flow.submit_busy || flow.step != ProjectStep::Sessions {
+            return;
+        }
+        let (Some(harness), Some(device)) = (flow.import_source, flow.device.clone()) else {
+            return;
+        };
+        let pending: Vec<String> = self
+            .add_space_session_rows(cx)
+            .into_iter()
+            .filter(|s| self.imported_chat(&device.id, &s.id, harness, cx).is_none())
+            .map(|s| s.id)
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.submit_busy = true;
+            flow.error = None;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let mut space_id = None;
+            let mut failed = 0;
+            let mut last_error = None;
+            for session_id in pending {
+                let mut params = base_params.clone();
+                params.insert("harness".into(), serde_json::json!(harness));
+                params.insert("sessionId".into(), serde_json::Value::String(session_id));
+                let result = engine
+                    .client()
+                    .call(
+                        methods::IMPORT_AGENT_SESSION,
+                        serde_json::Value::Object(params),
+                    )
+                    .await
+                    .map_err(|err| err.to_string())
+                    .and_then(|value| {
+                        serde_json::from_value::<ImportedAgentSession>(value)
+                            .map_err(|err| err.to_string())
+                    });
+                match result {
+                    Ok(imported) => space_id = Some(imported.space_id),
+                    Err(err) => {
+                        failed += 1;
+                        last_error = Some(err);
+                    }
+                }
+            }
+            this.update(cx, |shell, cx| {
+                match (failed, space_id) {
+                    (0, Some(space_id)) => {
+                        shell.add_space = None;
+                        shell.land_in_space(space_id, cx);
+                    }
+                    _ => {
+                        if let Some(flow) = shell.add_space.as_mut() {
+                            flow.submit_busy = false;
+                            flow.error = last_error.map(|err| {
+                                format!("{failed} conversation(s) could not be imported: {err}")
+                                    .into()
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.submit_task = Some(task);
+        }
+        cx.notify();
+    }
+
     /// ListDrives on the flow's device (relay-forwarded when remote).
     /// Failures stay silent — the section just shows Home; the folder
     /// browser's own error row already covers "device didn't respond".
@@ -5439,7 +5920,13 @@ impl Shell {
             }
             ProjectStep::Import => {
                 if let Some(project) = self.add_space_import_rows(cx).get(flow.active).cloned() {
-                    self.import_agent_project(project, cx);
+                    self.add_space_open_import_row(project, cx);
+                }
+                return;
+            }
+            ProjectStep::Sessions => {
+                if let Some(session) = self.add_space_session_rows(cx).get(flow.active).cloned() {
+                    self.import_agent_session(session, cx);
                 }
                 return;
             }
@@ -5858,6 +6345,7 @@ impl Shell {
             ProjectStep::Devices => return,
             ProjectStep::Locations => self.add_space_back_to(ProjectStep::Devices, cx),
             ProjectStep::Import => self.add_space_back_to(ProjectStep::Locations, cx),
+            ProjectStep::Sessions => self.add_space_back_to_import(cx),
             ProjectStep::Folders => {
                 let listing = flow.browser.ready();
                 let root = flow
@@ -5886,7 +6374,11 @@ impl Shell {
     fn add_space_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         // ←/→ act on the FOLDERS, not the text cursor — the palette is a
         // navigator first; queries are short and edited with ⌫.
+        let step = self.add_space.as_ref().map(|f| f.step);
         match event.keystroke.key.as_str() {
+            // → navigates; in Sessions the only way forward is an import,
+            // which stays on ⏎.
+            "right" if step == Some(ProjectStep::Sessions) => return,
             "right" => {
                 self.add_space_open_active(cx);
                 return;
@@ -5919,6 +6411,7 @@ impl Shell {
                     Some(ProjectStep::Devices) => self.add_space_devices(cx).len(),
                     Some(ProjectStep::Locations) => self.add_space_locations(cx).len(),
                     Some(ProjectStep::Import) => self.add_space_import_rows(cx).len(),
+                    Some(ProjectStep::Sessions) => self.add_space_session_rows(cx).len(),
                     _ => self.add_space_filtered(cx).len(),
                 };
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
@@ -5928,6 +6421,7 @@ impl Shell {
                     // past the viewport (user-reported: the list didn't
                     // follow the keyboard).
                     flow.list_scroll.scroll_to_item(flow.active);
+                    self.add_space_ensure_preview(cx);
                     cx.notify();
                 }
             }
@@ -5938,17 +6432,18 @@ impl Shell {
             // subfolders; the usual target (a repo root full of subfolders)
             // is only ever "the folder you're standing in".
             popover::MenuKey::Enter => self.add_space_open_active(cx),
-            popover::MenuKey::ModEnter => {
-                if self
-                    .add_space
-                    .as_ref()
-                    .is_some_and(|f| f.step == ProjectStep::Import)
-                {
-                    self.import_all_agent_projects(cx);
-                } else {
-                    self.submit_add_space(cx);
+            // ⌘⏎ adds without descending: the highlighted project's folder
+            // (Import) or every listed conversation (Sessions).
+            popover::MenuKey::ModEnter => match step {
+                Some(ProjectStep::Import) => {
+                    let active = self.add_space.as_ref().map_or(0, |f| f.active);
+                    if let Some(project) = self.add_space_import_rows(cx).get(active).cloned() {
+                        self.import_agent_project(project, cx);
+                    }
                 }
-            }
+                Some(ProjectStep::Sessions) => self.import_all_agent_sessions(cx),
+                _ => self.submit_add_space(cx),
+            },
             popover::MenuKey::Backspace => {
                 let empty = self
                     .add_space
@@ -5990,6 +6485,10 @@ impl Shell {
         let drives_loading = matches!(flow.drives, Loadable::Loading);
         let agents_loading = matches!(flow.agent_projects, Loadable::Loading);
         let import_source = flow.import_source;
+        let import_project = flow.import_project.clone();
+        let sessions_loading = matches!(flow.sessions, Loadable::Idle | Loadable::Loading);
+        let sessions_error = flow.sessions.error().map(str::to_string);
+        let preview_scroll = flow.preview_scroll.clone();
         let ghost = self
             .add_space_completion(cx)
             .map(|(_, suffix)| SharedString::from(suffix));
@@ -6088,7 +6587,7 @@ impl Shell {
                     rows.push(
                         row(ix)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.import_agent_project(project.clone(), cx)
+                                this.add_space_open_import_row(project.clone(), cx)
                             }))
                             .child(
                                 icon(icons::FOLDER)
@@ -6125,6 +6624,56 @@ impl Shell {
                                         .child("Added"),
                                 )
                             })
+                            .into_any_element(),
+                    );
+                }
+            }
+            ProjectStep::Sessions => {
+                let device_id = device.as_ref().map(|d| d.id.clone()).unwrap_or_default();
+                let now = Utc::now();
+                for (ix, session) in self.add_space_session_rows(cx).into_iter().enumerate() {
+                    let imported = import_source.is_some_and(|harness| {
+                        self.imported_chat(&device_id, &session.id, harness, cx)
+                            .is_some()
+                    });
+                    let mut meta = Vec::new();
+                    if let Some(at) = session.updated_at {
+                        meta.push(format_time_ago(at, now));
+                    }
+                    meta.push(match session.prompt_count {
+                        1 => "1 prompt".to_string(),
+                        n => format!("{n} prompts"),
+                    });
+                    let title = session.title.clone();
+                    rows.push(
+                        row(ix)
+                            .on_mouse_move(cx.listener(
+                                move |this, _: &gpui::MouseMoveEvent, _, cx| {
+                                    this.add_space_hover_session(ix, cx)
+                                },
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.import_agent_session(session.clone(), cx)
+                            }))
+                            .child(
+                                icon(icons::CHAT_ROUND_LINE)
+                                    .size(px(17.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(
+                                popover::search_highlight(title.into(), Some(&query), &theme),
+                            ))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(if imported {
+                                        "Imported".to_string()
+                                    } else {
+                                        meta.join(" · ")
+                                    })),
+                            )
                             .into_any_element(),
                     );
                 }
@@ -6168,9 +6717,10 @@ impl Shell {
             flow.active = flow.active.min(rows.len().saturating_sub(1));
         }
         let empty = rows.is_empty();
+        let list_height = (f32::from(viewport.height) - 220.0).clamp(100.0, 424.0);
         let mut results = div()
             .id("project-results")
-            .max_h(px((f32::from(viewport.height) - 220.0).clamp(100.0, 424.0)))
+            .max_h(px(list_height))
             .overflow_y_scroll()
             .track_scroll(&scroll)
             .px(px(popover::CARD_INSET))
@@ -6178,7 +6728,9 @@ impl Shell {
             .flex_col()
             .gap(px(SIDEBAR_LIST_GAP))
             .children(rows);
-        if step == ProjectStep::Folders && loading {
+        if (step == ProjectStep::Folders && loading)
+            || (step == ProjectStep::Sessions && sessions_loading && sessions_error.is_none())
+        {
             results = results.child(popover::skeleton_rows(
                 "project-loading",
                 &theme,
@@ -6186,6 +6738,22 @@ impl Shell {
                 cx.entity_id(),
                 cx,
             ));
+        } else if let Some(message) = sessions_error.filter(|_| step == ProjectStep::Sessions) {
+            results = results.child(
+                popover::error_row(&theme, &message).p(px(14.0)).child(
+                    popover::btn_ghost(&theme, "Retry", "project-sessions-retry")
+                        .id("project-sessions-retry")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(project) = this
+                                .add_space
+                                .as_ref()
+                                .and_then(|f| f.import_project.clone())
+                            {
+                                this.add_space_goto_sessions(project, cx);
+                            }
+                        })),
+                ),
+            );
         } else if let Some(message) = load_error.filter(|_| step == ProjectStep::Folders) {
             results = results.child(
                 popover::error_row(&theme, &message).p(px(14.0)).child(
@@ -6206,6 +6774,8 @@ impl Shell {
                     ProjectStep::Folders => "No folders match",
                     ProjectStep::Import if query.is_empty() => "No projects found",
                     ProjectStep::Import => "No projects match",
+                    ProjectStep::Sessions if query.is_empty() => "No conversations found",
+                    ProjectStep::Sessions => "No conversations match",
                 },
             ));
         }
@@ -6303,10 +6873,29 @@ impl Shell {
         }
         if let Some(harness) = import_source {
             let (glyph, _) = crate::pickers::harness_brand_icon(harness);
+            trail = trail.child(segment(
+                crumb(
+                    "project-crumb-import".into(),
+                    format!("Import from {}", import_source_label(harness)).into(),
+                    Some(glyph),
+                    step == ProjectStep::Import,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this
+                        .add_space
+                        .as_ref()
+                        .is_some_and(|f| f.step == ProjectStep::Sessions)
+                    {
+                        this.add_space_back_to_import(cx);
+                    }
+                })),
+            ));
+        }
+        if let Some(project) = import_project {
             trail = trail.child(segment(crumb(
-                "project-crumb-import".into(),
-                format!("Import from {}", import_source_label(harness)).into(),
-                Some(glyph),
+                "project-crumb-import-project".into(),
+                project.name.into(),
+                Some(icons::FOLDER),
                 true,
             )));
         }
@@ -6424,10 +7013,13 @@ impl Shell {
             .child(popover::key_hint_text(
                 &theme,
                 "↵",
-                if step == ProjectStep::Import {
-                    "Add"
-                } else {
-                    "Open"
+                match step {
+                    ProjectStep::Import if import_source.is_some_and(imports_conversations) => {
+                        "Conversations"
+                    }
+                    ProjectStep::Import => "Add",
+                    ProjectStep::Sessions => "Import",
+                    _ => "Open",
                 },
             ))
             .child(popover::key_hint_text(&theme, "esc", "Close"))
@@ -6467,12 +7059,52 @@ impl Shell {
                     .h(px(22.0))
                     .py(px(0.0))
                     .flex_none()
+                    .when(busy || empty, |el| el.opacity(0.5))
+                    .on_click(cx.listener(|this, _, _, cx| this.import_all_agent_projects(cx))),
+                )
+                .child(
+                    popover::btn_ghost(&theme, "Add project", "project-import-add")
+                        .id("project-import-add")
+                        .h(px(22.0))
+                        .py(px(0.0))
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .when(busy || empty, |el| el.opacity(0.5))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let active = this.add_space.as_ref().map_or(0, |f| f.active);
+                            if let Some(project) =
+                                this.add_space_import_rows(cx).get(active).cloned()
+                            {
+                                this.import_agent_project(project, cx);
+                            }
+                        }))
+                        .child(
+                            popover::key_cap(&theme)
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .child(crate::settings::badge_combo("mod-enter")),
+                        ),
+                )
+            })
+            .when(step == ProjectStep::Sessions, |el| {
+                el.child(
+                    popover::btn_ghost(
+                        &theme,
+                        if busy { "Importing…" } else { "Import all" },
+                        "project-sessions-import-all",
+                    )
+                    .id("project-sessions-import-all")
+                    .h(px(22.0))
+                    .py(px(0.0))
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
                     .when(busy || empty, |el| el.opacity(0.5))
-                    .on_click(cx.listener(|this, _, _, cx| this.import_all_agent_projects(cx)))
+                    .on_click(cx.listener(|this, _, _, cx| this.import_all_agent_sessions(cx)))
                     .child(
                         popover::key_cap(&theme)
                             .text_size(crate::typography::ui_rems(11.0))
@@ -6480,11 +7112,41 @@ impl Shell {
                     ),
                 )
             });
+        let body = if step == ProjectStep::Sessions {
+            let preview = self.render_session_preview(&theme, import_source, active, cx);
+            div()
+                .flex()
+                .flex_row()
+                .h(px(list_height))
+                .child(div().w(px(340.0)).flex_none().min_h_0().child(results))
+                .child(
+                    div()
+                        .id("session-preview")
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&preview_scroll)
+                        .border_l_1()
+                        .border_color(theme.border)
+                        .px(px(16.0))
+                        .py(px(8.0))
+                        .child(preview),
+                )
+                .into_any_element()
+        } else {
+            results.into_any_element()
+        };
+        let card_width: f32 = if step == ProjectStep::Sessions {
+            940.0
+        } else {
+            600.0
+        };
         let card =
             div()
                 .id("add-space-palette")
                 .track_focus(&focus)
-                .w(px(600.0_f32.min(f32::from(viewport.width) - 32.0)))
+                .w(px(card_width.min(f32::from(viewport.width) - 32.0)))
                 .flex()
                 .flex_col()
                 .rounded(px(14.0))
@@ -6502,7 +7164,7 @@ impl Shell {
                 }))
                 .child(header)
                 .child(crumbs)
-                .child(div().min_h_0().py(px(popover::CARD_INSET)).child(results))
+                .child(div().min_h_0().py(px(popover::CARD_INSET)).child(body))
                 .when_some(error, |el, error| {
                     el.child(
                         div()
@@ -6531,6 +7193,103 @@ impl Shell {
             .priority(2)
             .into_any_element(),
         )
+    }
+
+    /// The Sessions step's preview pane: the highlighted conversation's
+    /// latest messages, oldest first.
+    fn render_session_preview(
+        &self,
+        theme: &Theme,
+        harness: Option<HarnessId>,
+        active: usize,
+        cx: &App,
+    ) -> AnyElement {
+        let muted = |text: &'static str| {
+            div()
+                .py(px(16.0))
+                .text_color(theme.text_muted)
+                .child(text)
+                .into_any_element()
+        };
+        let rows = self.add_space_session_rows(cx);
+        let Some(session) = rows.get(active.min(rows.len().saturating_sub(1))) else {
+            return div().into_any_element();
+        };
+        let state = self
+            .add_space
+            .as_ref()
+            .and_then(|f| f.previews.get(&session.id))
+            .cloned();
+        let preview = match state {
+            Some(Loadable::Ready(preview)) => preview,
+            Some(Loadable::Error(message)) => {
+                return popover::error_row(theme, &message)
+                    .py(px(16.0))
+                    .into_any_element();
+            }
+            _ => return muted("Loading conversation…"),
+        };
+        if preview.messages.is_empty() {
+            return muted("This conversation has no messages to show.");
+        }
+        let agent = harness.map_or("Agent", import_source_label);
+        let now = Utc::now();
+        let small = crate::typography::ui_rems(11.0);
+        let mut column = div().flex().flex_col().gap(px(12.0)).pb(px(8.0));
+        if preview.omitted > 0 {
+            column = column.child(div().text_size(small).text_color(theme.text_faint).child(
+                SharedString::from(format!(
+                    "{} earlier message{} not shown",
+                    preview.omitted,
+                    if preview.omitted == 1 { "" } else { "s" }
+                )),
+            ));
+        }
+        for line in &preview.messages {
+            let mut label = if line.user { "You" } else { agent }.to_string();
+            if let Some(at) = line.at {
+                label.push_str(" · ");
+                label.push_str(&format_time_ago(at, now));
+            }
+            let mut message = div().flex().flex_col().gap(px(4.0)).child(
+                div()
+                    .text_size(small)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(label)),
+            );
+            if !line.text.is_empty() {
+                message = message.child(
+                    div()
+                        .text_size(crate::typography::ui_rems(12.5))
+                        .text_color(theme.text)
+                        .when(line.user, |el| {
+                            el.px(px(10.0))
+                                .py(px(6.0))
+                                .rounded(px(8.0))
+                                .bg(theme.element_hover)
+                        })
+                        .child(line.text.clone()),
+                );
+            }
+            for tool in &line.tools {
+                message = message.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(small)
+                        .text_color(theme.text_muted)
+                        .child(
+                            icon(icons::ALT_ARROW_RIGHT)
+                                .size(px(10.0))
+                                .text_color(theme.text_faint),
+                        )
+                        .child(div().min_w_0().truncate().child(tool.clone())),
+                );
+            }
+            column = column.child(message);
+        }
+        column.into_any_element()
     }
 
     // ---- space context menu / rename / delete overlays ----
@@ -6991,6 +7750,99 @@ mod project_flow_tests {
             assert_eq!(flow.step, ProjectStep::Locations);
             assert_eq!(flow.import_source, None);
             assert!(flow.agent_projects.ready().is_some(), "kept for re-entry");
+        });
+    }
+
+    #[gpui::test]
+    fn sessions_step_lists_conversations_and_returns_to_projects(cx: &mut gpui::TestAppContext) {
+        let data = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, data.path());
+        let session = |id: &str, title: &str| AgentSession {
+            id: id.into(),
+            title: title.into(),
+            cwd: "/work/beta".into(),
+            updated_at: None,
+            prompt_count: 2,
+        };
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.chats.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "chat-1", "deviceId": "remote", "title": "Fix bug",
+                        "archived": false, "createdAt": "2026-09-01T10:00:00Z",
+                        "harnessSessionId": "s1",
+                        "config": {"harness": "claude-code", "model": null,
+                                   "reasoning": null, "sandbox": "workspace-write"}
+                    }))
+                    .unwrap(),
+                );
+            });
+            shell.open_add_space(cx);
+            let search = shell.add_space.as_ref().unwrap().search.clone();
+            search.update(cx, |input, cx| input.set_text("server", cx));
+            shell.add_space_open_active(cx);
+            let flow = shell.add_space.as_mut().unwrap();
+            flow.drives = Loadable::Ready(Vec::new());
+            flow.agent_projects = Loadable::Ready(vec![AgentProjectSource {
+                harness: HarnessId::ClaudeCode,
+                projects: vec![
+                    agent_project("/work/alpha", false),
+                    agent_project("/work/beta", true),
+                ],
+            }]);
+            search.update(cx, |input, cx| input.set_text("claude", cx));
+            shell.add_space_open_active(cx);
+            // Enter on a Claude project opens its conversations, not an import.
+            search.update(cx, |input, cx| input.set_text("beta", cx));
+            shell.add_space_open_active(cx);
+            let flow = shell.add_space.as_mut().unwrap();
+            assert_eq!(flow.step, ProjectStep::Sessions);
+            assert_eq!(flow.import_project.as_ref().unwrap().path, "/work/beta");
+            assert!(flow.search.read(cx).is_empty());
+            assert!(
+                flow.sessions.error().is_some(),
+                "no engine in tests: the listing reports the device offline"
+            );
+            flow.sessions =
+                Loadable::Ready(vec![session("s1", "Fix bug"), session("s2", "Add docs")]);
+            assert_eq!(shell.add_space_session_rows(cx).len(), 2);
+            search.update(cx, |input, cx| input.set_text("docs", cx));
+            let rows = shell.add_space_session_rows(cx);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "s2");
+            assert_eq!(
+                shell.imported_chat("remote", "s1", HarnessId::ClaudeCode, cx),
+                Some(("chat-1".to_string(), None)),
+                "an earlier import is recognized by its harness session"
+            );
+            assert_eq!(
+                shell.imported_chat("remote", "s1", HarnessId::Codex, cx),
+                None
+            );
+            assert_eq!(
+                shell.imported_chat("remote", "s2", HarnessId::ClaudeCode, cx),
+                None
+            );
+        });
+        // Each user action is its own update, so its query clear flushes alone.
+        shell.update(cx, |shell, cx| {
+            shell.add_space_go_up(cx);
+            let flow = shell.add_space.as_ref().unwrap();
+            assert_eq!(flow.step, ProjectStep::Import);
+            assert_eq!(flow.import_source, Some(HarnessId::ClaudeCode));
+            assert!(flow.import_project.is_none());
+            assert!(flow.sessions.ready().is_none());
+            assert_eq!(
+                flow.restore_active,
+                Some(1),
+                "back lands on the project we came from"
+            );
+        });
+        // The query clear's Edited event applies the restored highlight.
+        shell.update(cx, |shell, _| {
+            let flow = shell.add_space.as_ref().unwrap();
+            assert_eq!(flow.active, 1);
+            assert_eq!(flow.restore_active, None);
         });
     }
 

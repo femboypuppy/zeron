@@ -21,7 +21,10 @@
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `ListAgentProjects` → `AgentProjectListing` (folders
-//!   other coding agents used on the device), `CreateWorktree {repoPath, branch}`,
+//!   other coding agents used on the device), `ListAgentSessions {harness, path}`,
+//!   `PreviewAgentSession {harness, sessionId}`, `ImportAgentSession {harness,
+//!   sessionId}` → `ImportedAgentSession` (a chat resuming that conversation),
+//!   `CreateWorktree {repoPath, branch}`,
 //!   `DeleteWorktree {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of
 //!   `CheckoutDiff[]`
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
@@ -290,6 +293,20 @@ struct RunProjectActionParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAgentSessionsParams {
+    harness: zeron_proto::HarnessId,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSessionParams {
+    harness: zeron_proto::HarnessId,
+    session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1277,6 +1294,11 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_FOLDERS
             | methods::LIST_DRIVES
             | methods::LIST_AGENT_PROJECTS
+            | methods::LIST_AGENT_SESSIONS
+            | methods::PREVIEW_AGENT_SESSION
+            // The conversation (and the chat that resumes it) lives on the
+            // device whose agent recorded it.
+            | methods::IMPORT_AGENT_SESSION
             | methods::SEARCH_FILES
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
@@ -2573,6 +2595,32 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&zeron_proto::AgentProjectListing { sources })
+            }
+            methods::LIST_AGENT_SESSIONS => {
+                let p: ListAgentSessionsParams = parse_params(params)?;
+                let sessions = crate::agent_sessions::list_sessions(p.harness, p.path)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&zeron_proto::AgentSessionListing { sessions })
+            }
+            methods::PREVIEW_AGENT_SESSION => {
+                let p: AgentSessionParams = parse_params(params)?;
+                let preview = crate::agent_sessions::preview_session(p.harness, p.session_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&preview)
+            }
+            methods::IMPORT_AGENT_SESSION => {
+                let p: AgentSessionParams = parse_params(params)?;
+                let imported = crate::agent_sessions::import_session(
+                    self.doc_host.clone(),
+                    self.workspace.clone(),
+                    p.harness,
+                    p.session_id,
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&imported)
             }
             methods::SEARCH_FILES => {
                 let p: FileSearchParams = parse_params(params)?;

@@ -58,6 +58,19 @@ use catalog::{apply_ultrathink, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 
+/// Decode a Claude Code `tool_use` block (name + input) into a typed
+/// [`zeron_proto::ToolCall`] — the live driver's mapping, shared with the
+/// engine's import of on-disk Claude transcripts.
+pub fn decode_tool_use(name: &str, input: &Value) -> zeron_proto::ToolCall {
+    normalize::decode_tool_use(name, input)
+}
+
+/// CLI-synthesized user-frame text that is not conversation
+/// (`<system-reminder>` injections, the interruption marker).
+pub fn is_synthetic_user_text(text: &str) -> bool {
+    normalize::is_synthetic_user_text(text)
+}
+
 /// Locate the device's installed Claude Code CLI: our own PATH, then the
 /// login-shell PATH snapshot (the user's shell init shapes PATH in ways a
 /// GUI/service launch never sees — see [`crate::shell_env`]), then known

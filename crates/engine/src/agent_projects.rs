@@ -298,7 +298,7 @@ impl Found {
 /// an absolute path here (e.g. a POSIX path recorded on another OS). Strips
 /// Windows verbatim prefixes, unifies separators, uppercases drive letters,
 /// and drops trailing separators.
-fn normalize_path(raw: &str) -> Option<String> {
+pub(crate) fn normalize_path(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -325,7 +325,7 @@ fn normalize_path(raw: &str) -> Option<String> {
 }
 
 /// Identity for dedupe: Windows paths compare case-insensitively.
-fn path_key(path: &str) -> String {
+pub(crate) fn path_key(path: &str) -> String {
     if cfg!(windows) {
         path.to_lowercase()
     } else {
@@ -428,11 +428,11 @@ fn excluded_roots(home: &Path) -> Vec<PathBuf> {
     roots
 }
 
-fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(str::to_string)
 }
 
-fn read_json(path: &Path) -> Option<serde_json::Value> {
+pub(crate) fn read_json(path: &Path) -> Option<serde_json::Value> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -442,7 +442,7 @@ fn modified(path: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(time))
 }
 
-fn subdirs(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn subdirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -453,7 +453,7 @@ fn subdirs(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Files with extension `ext` up to `depth` levels below `dir`, with mtimes.
-fn collect_files(
+pub(crate) fn collect_files(
     dir: &Path,
     depth: usize,
     ext: &str,
@@ -485,7 +485,7 @@ fn collect_files(
     }
 }
 
-fn newest_first(files: &mut [(PathBuf, Option<DateTime<Utc>>)]) {
+pub(crate) fn newest_first(files: &mut [(PathBuf, Option<DateTime<Utc>>)]) {
     files.sort_by(|a, b| b.1.cmp(&a.1));
 }
 
@@ -511,7 +511,7 @@ fn newest_transcript_cwd(
 
 /// The first `pick` hit among a JSONL file's first `max_lines` lines. An
 /// oversized line ends the scan (the rest of the file can't be framed).
-fn scan_jsonl(
+pub(crate) fn scan_jsonl(
     path: &Path,
     max_lines: usize,
     pick: impl Fn(&serde_json::Value) -> Option<String>,
@@ -538,7 +538,7 @@ fn scan_jsonl(
 
 /// Codex versions its state database by file name (`state_5.sqlite`); the
 /// highest version is the live one.
-fn newest_codex_state_db(codex_home: &Path) -> Option<PathBuf> {
+pub(crate) fn newest_codex_state_db(codex_home: &Path) -> Option<PathBuf> {
     std::fs::read_dir(codex_home)
         .ok()?
         .flatten()

@@ -154,6 +154,12 @@ pub mod methods {
     /// Project folders other coding agents (Claude Code, Codex, opencode, …)
     /// have worked in on the device — the New project flow's import source.
     pub const LIST_AGENT_PROJECTS: &str = "ListAgentProjects";
+    /// Conversations one agent recorded in a project folder on the device.
+    pub const LIST_AGENT_SESSIONS: &str = "ListAgentSessions";
+    /// A bounded, read-only preview of one agent conversation.
+    pub const PREVIEW_AGENT_SESSION: &str = "PreviewAgentSession";
+    /// Copy one agent conversation into a new chat that resumes it.
+    pub const IMPORT_AGENT_SESSION: &str = "ImportAgentSession";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     // Device-local workspace filesystem operations. All are relay-forwardable;

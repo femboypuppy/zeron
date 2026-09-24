@@ -3436,6 +3436,12 @@ fn cap_text(text: &str, cap: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+/// Type an opencode-native tool invocation — shared with the engine's import
+/// of opencode's stored sessions.
+pub fn decode_tool_call(name: &str, input: &Value) -> ToolCall {
+    oc_tool_call(name, input)
+}
+
 /// Type an opencode-native tool invocation.
 fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
     let s = |keys: &[&str]| {

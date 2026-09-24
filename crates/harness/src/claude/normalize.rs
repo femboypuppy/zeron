@@ -168,7 +168,7 @@ fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
 ///
 /// Prefix-matched: the CLI ships at least two spellings of the marker
 /// (`…by user]` and `…by user for tool use]`).
-fn is_synthetic_user_text(text: &str) -> bool {
+pub(crate) fn is_synthetic_user_text(text: &str) -> bool {
     let text = text.trim_start();
     text.starts_with("<system-reminder>") || text.starts_with("[Request interrupted")
 }

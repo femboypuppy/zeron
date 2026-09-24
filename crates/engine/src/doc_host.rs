@@ -1113,6 +1113,29 @@ impl DocHost {
         &self.inner.config.device_id
     }
 
+    /// Seed a brand-new chat's transcript from a doc built offline (the import
+    /// of another agent's conversation). Same shape as a chat born on chat2:
+    /// cursor 0 makes the first room join publish the whole log, and epoch 2
+    /// keeps [`Self::open`] on the chat2 branch. Refuses a chat that already
+    /// has a stored doc or an open handle — seeding never overwrites.
+    pub fn seed_chat_snapshot(&self, chat_id: &str, snapshot: &[u8]) -> Result<(), EngineError> {
+        let _opening = lock(&self.inner.opening);
+        if lock(&self.inner.handles).contains_key(chat_id)
+            || self.inner.store.load_snapshot(chat_id)?.is_some()
+        {
+            return Err(EngineError::Other(format!(
+                "chat {chat_id} already has a transcript"
+            )));
+        }
+        self.inner.store.save_snapshot_with_cursor(
+            chat_id,
+            snapshot,
+            0,
+            crate::chat2_host::CHAT2_DOC_EPOCH,
+        )?;
+        Ok(())
+    }
+
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {

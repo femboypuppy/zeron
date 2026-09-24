@@ -470,6 +470,70 @@ pub struct AgentProjectListing {
     pub sources: Vec<AgentProjectSource>,
 }
 
+/// One conversation another agent recorded in a project folder
+/// (`ListAgentSessions`). `id` is the agent's own session id — the value a
+/// Zeron chat resumes once the conversation is imported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSession {
+    pub id: String,
+    pub title: String,
+    /// The folder the agent ran in, as the agent recorded it.
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Prompts the user sent in the conversation.
+    pub prompt_count: usize,
+}
+
+/// `ListAgentSessions` reply, most recently updated first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionListing {
+    pub sessions: Vec<AgentSession>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPreviewRole {
+    User,
+    Assistant,
+}
+
+/// One message of a conversation preview: prose (possibly truncated) plus the
+/// one-line labels of the tools the agent ran in that message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPreviewMessage {
+    pub role: AgentPreviewRole,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<DateTime<Utc>>,
+}
+
+/// `PreviewAgentSession` reply: the conversation's latest messages, oldest
+/// first. `omitted` counts earlier messages left out of the preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionPreview {
+    pub messages: Vec<AgentPreviewMessage>,
+    #[serde(default)]
+    pub omitted: usize,
+}
+
+/// `ImportAgentSession` reply: the chat holding the imported conversation.
+/// `existing` is true when an earlier import already created it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedAgentSession {
+    pub chat_id: String,
+    pub space_id: String,
+    #[serde(default)]
+    pub existing: bool,
+}
+
 /// A workspace-relative file or directory returned by `SearchFiles`.
 /// Contents deliberately never cross this boundary: mentioning a path leaves
 /// the harness to read it through its normal workspace tools when needed.
