@@ -1346,7 +1346,7 @@ impl Drop for CancelOnDrop {
     }
 }
 
-async fn disposable_worker<T: Send + 'static>(
+pub(crate) async fn disposable_worker<T: Send + 'static>(
     name: &'static str,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {

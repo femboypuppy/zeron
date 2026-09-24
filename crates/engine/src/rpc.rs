@@ -20,8 +20,10 @@
 //!   `SelectOrg {organizationId}`
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
-//!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//!   `ListFolders {path?}`, `ListAgentProjects` → `AgentProjectListing` (folders
+//!   other coding agents used on the device), `CreateWorktree {repoPath, branch}`,
+//!   `DeleteWorktree {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of
+//!   `CheckoutDiff[]`
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
 //!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
@@ -1274,6 +1276,7 @@ fn forwardable(method: &str) -> bool {
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
             | methods::LIST_DRIVES
+            | methods::LIST_AGENT_PROJECTS
             | methods::SEARCH_FILES
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
@@ -2564,6 +2567,12 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&zeron_proto::DriveListing { drives })
+            }
+            methods::LIST_AGENT_PROJECTS => {
+                let sources = crate::agent_projects::list_agent_projects()
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&zeron_proto::AgentProjectListing { sources })
             }
             methods::SEARCH_FILES => {
                 let p: FileSearchParams = parse_params(params)?;

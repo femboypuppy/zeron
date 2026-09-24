@@ -16,6 +16,7 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
+pub mod agent_projects;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;

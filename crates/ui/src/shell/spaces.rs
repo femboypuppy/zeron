@@ -12,7 +12,10 @@ use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use gpui::{FocusHandle, Window};
 use std::collections::HashSet;
-use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
+use zeron_proto::{
+    AgentProject, AgentProjectListing, AgentProjectSource, ChatIndicator, Device, DriveEntry,
+    DriveListing, FolderListing, HarnessId, Space,
+};
 
 /// Promote the user's ordered pins above the untouched activity projection.
 /// Every unpinned id keeps exactly the relative order supplied by recency.
@@ -1991,11 +1994,61 @@ pub(super) enum SpacesMenuRow {
 }
 
 /// New project navigates devices, locations, then folders on a command-palette surface.
+/// A location may instead be another agent's history (`Import`), whose rows are
+/// the folders that agent has worked in on the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProjectStep {
     Devices,
     Locations,
     Folders,
+    Import,
+}
+
+/// One row of the Locations step: a browse root, or an agent to import from.
+#[derive(Clone, Debug, PartialEq)]
+enum LocationRow {
+    Place { name: String, path: Option<String> },
+    Import { harness: HarnessId, count: usize },
+}
+
+impl LocationRow {
+    fn label(&self) -> String {
+        match self {
+            Self::Place { name, .. } => name.clone(),
+            Self::Import { harness, .. } => {
+                format!("Import from {}", import_source_label(*harness))
+            }
+        }
+    }
+}
+
+/// Display name of an agent whose projects can be imported.
+fn import_source_label(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "Claude Code",
+        HarnessId::Codex => "Codex",
+        HarnessId::Cursor => "Cursor",
+        HarnessId::Devin => "Devin",
+        HarnessId::Grok => "Grok",
+        HarnessId::Hermes => "Hermes",
+        HarnessId::Pi => "Pi",
+        HarnessId::Opencode => "OpenCode",
+        HarnessId::Antigravity => "Antigravity",
+        HarnessId::Mock => "Mock",
+    }
+}
+
+/// Whether two recorded paths name the same folder: separators and trailing
+/// slashes are ignored, and Windows-shaped paths compare case-insensitively.
+fn same_folder(a: &str, b: &str) -> bool {
+    let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_string();
+    let (a, b) = (norm(a), norm(b));
+    let windows = |p: &str| p.as_bytes().get(1) == Some(&b':') || p.starts_with("//");
+    if windows(&a) || windows(&b) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
 }
 
 pub(super) struct AddSpaceFlow {
@@ -2011,6 +2064,11 @@ pub(super) struct AddSpaceFlow {
     /// The selected device's mounted drives/volumes.
     /// Best-effort: an error just leaves the section at Home only.
     drives: Loadable<Vec<DriveEntry>>,
+    /// Folders other agents have worked in on the selected device, per agent.
+    /// Best-effort like `drives`: an error just hides the import rows.
+    agent_projects: Loadable<Vec<AgentProjectSource>>,
+    /// The agent whose projects the Import step lists.
+    import_source: Option<HarnessId>,
     /// Requested browser path (`None` = the device's default, i.e. home).
     browser_path: Option<String>,
     /// The device's home (the path a `None` browse resolved to) — breadcrumbs
@@ -2034,6 +2092,7 @@ pub(super) struct AddSpaceFlow {
     focus_pending: bool,
     load_task: Option<Task<()>>,
     drives_task: Option<Task<()>>,
+    agent_projects_task: Option<Task<()>>,
     submit_task: Option<Task<()>>,
     _search_events: Subscription,
 }
@@ -5024,6 +5083,8 @@ impl Shell {
             search,
             browser: Loadable::Idle,
             drives: Loadable::Idle,
+            agent_projects: Loadable::Idle,
+            import_source: None,
             browser_path: None,
             home: None,
             browser_repo: false,
@@ -5035,6 +5096,7 @@ impl Shell {
             focus_pending: true,
             load_task: None,
             drives_task: None,
+            agent_projects_task: None,
             submit_task: None,
             _search_events: search_events,
         });
@@ -5051,10 +5113,13 @@ impl Shell {
         flow.location = None;
         flow.load_task = None;
         flow.drives_task = None;
+        flow.agent_projects_task = None;
         flow.list_scroll.set_offset(gpui::Point::default());
         flow.device = Some(device);
         flow.browser = Loadable::Idle;
         flow.drives = Loadable::Idle;
+        flow.agent_projects = Loadable::Idle;
+        flow.import_source = None;
         flow.browser_path = None;
         flow.home = None;
         flow.browser_repo = false;
@@ -5066,6 +5131,7 @@ impl Shell {
             input.set_text("", cx);
         });
         self.load_space_drives(cx);
+        self.load_agent_projects(cx);
         cx.notify();
     }
 
@@ -5100,14 +5166,17 @@ impl Shell {
         flow.browser = Loadable::Idle;
         flow.browser_path = None;
         flow.location = None;
+        flow.import_source = None;
         flow.browser_repo = false;
         flow.active = 0;
         flow.error = None;
         flow.list_scroll.set_offset(gpui::Point::default());
         if step == ProjectStep::Devices {
             flow.drives_task = None;
+            flow.agent_projects_task = None;
             flow.device = None;
             flow.drives = Loadable::Idle;
+            flow.agent_projects = Loadable::Idle;
             flow.home = None;
         }
         let search = flow.search.clone();
@@ -5137,24 +5206,149 @@ impl Shell {
             .collect()
     }
 
-    fn add_space_locations(&self, cx: &App) -> Vec<(String, Option<String>)> {
+    fn add_space_locations(&self, cx: &App) -> Vec<LocationRow> {
         let Some(flow) = &self.add_space else {
             return Vec::new();
         };
-        let locations: Vec<_> = std::iter::once(("Home".to_string(), None))
-            .chain(
-                flow.drives
-                    .ready()
-                    .into_iter()
-                    .flatten()
-                    .map(|d| (d.name.clone(), Some(d.path.clone()))),
-            )
-            .collect();
-        let names: Vec<_> = locations.iter().map(|(name, _)| name.as_str()).collect();
-        popover::filter_indices(flow.search.read(cx).text(), &names)
+        let home = LocationRow::Place {
+            name: "Home".to_string(),
+            path: None,
+        };
+        let drives = flow
+            .drives
+            .ready()
+            .into_iter()
+            .flatten()
+            .map(|d| LocationRow::Place {
+                name: d.name.clone(),
+                path: Some(d.path.clone()),
+            });
+        let imports = flow
+            .agent_projects
+            .ready()
+            .into_iter()
+            .flatten()
+            .map(|source| LocationRow::Import {
+                harness: source.harness,
+                count: source.projects.len(),
+            });
+        let locations: Vec<_> = std::iter::once(home).chain(drives).chain(imports).collect();
+        let labels: Vec<_> = locations.iter().map(LocationRow::label).collect();
+        popover::filter_indices(flow.search.read(cx).text(), &labels)
             .into_iter()
             .map(|ix| locations[ix].clone())
             .collect()
+    }
+
+    /// Open a Locations row: browse a place, or list an agent's projects.
+    fn add_space_open_location(&mut self, row: LocationRow, cx: &mut Context<Self>) {
+        match row {
+            LocationRow::Place { name, path } => self.add_space_goto_location(name, path, cx),
+            LocationRow::Import { harness, .. } => self.add_space_goto_import(harness, cx),
+        }
+    }
+
+    fn add_space_goto_import(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        flow.focus_pending = true;
+        flow.step = ProjectStep::Import;
+        flow.import_source = Some(harness);
+        flow.location = None;
+        flow.active = 0;
+        flow.error = None;
+        flow.list_scroll.set_offset(gpui::Point::default());
+        let search = flow.search.clone();
+        search.update(cx, |input, cx| {
+            input.set_placeholder("Search projects…", cx);
+            input.set_text("", cx);
+        });
+        cx.notify();
+    }
+
+    /// The Import step's projects filtered by the query (name, then path).
+    fn add_space_import_rows(&self, cx: &App) -> Vec<AgentProject> {
+        let Some(flow) = self.add_space.as_ref() else {
+            return Vec::new();
+        };
+        if flow.step != ProjectStep::Import {
+            return Vec::new();
+        }
+        let Some(projects) = flow.agent_projects.ready().and_then(|sources| {
+            sources
+                .iter()
+                .find(|s| Some(s.harness) == flow.import_source)
+                .map(|s| &s.projects)
+        }) else {
+            return Vec::new();
+        };
+        let query = flow.search.read(cx).text();
+        let by_name: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
+        let mut picked = popover::filter_indices(query, &by_name);
+        let by_path: Vec<&str> = projects.iter().map(|p| p.path.as_str()).collect();
+        for ix in popover::filter_indices(query, &by_path) {
+            if !picked.contains(&ix) {
+                picked.push(ix);
+            }
+        }
+        picked.into_iter().map(|ix| projects[ix].clone()).collect()
+    }
+
+    /// The device's existing space for `path`, if any.
+    fn add_space_existing(&self, device_id: &str, path: &str, cx: &App) -> Option<String> {
+        self.state
+            .read(cx)
+            .spaces
+            .iter()
+            .find(|s| s.device_id == device_id && same_folder(&s.path, path))
+            .map(|s| s.id.clone())
+    }
+
+    /// ListAgentProjects on the flow's device (relay-forwarded when remote).
+    /// Failures stay silent — the Locations step just offers no imports.
+    fn load_agent_projects(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        let device_id = flow.device.as_ref().map(|d| d.id.clone());
+        flow.agent_projects = Loadable::Loading;
+        flow.agent_projects_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            // Only target remote devices — local calls skip the relay.
+            if let (Some(target), local) = (&device_id, &local)
+                && local.as_deref() != Some(target.as_str())
+            {
+                params.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
+            }
+            let result = engine
+                .client()
+                .call(
+                    methods::LIST_AGENT_PROJECTS,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(flow) = shell.add_space.as_mut() {
+                    flow.agent_projects = match result {
+                        Ok(value) => match serde_json::from_value::<AgentProjectListing>(value) {
+                            Ok(listing) => Loadable::Ready(listing.sources),
+                            Err(err) => Loadable::Error(err.to_string()),
+                        },
+                        Err(err) => Loadable::Error(err.to_string()),
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// ListDrives on the flow's device (relay-forwarded when remote).
@@ -5238,8 +5432,14 @@ impl Shell {
                 return;
             }
             ProjectStep::Locations => {
-                if let Some((name, path)) = self.add_space_locations(cx).get(flow.active).cloned() {
-                    self.add_space_goto_location(name, path, cx);
+                if let Some(row) = self.add_space_locations(cx).get(flow.active).cloned() {
+                    self.add_space_open_location(row, cx);
+                }
+                return;
+            }
+            ProjectStep::Import => {
+                if let Some(project) = self.add_space_import_rows(cx).get(flow.active).cloned() {
+                    self.import_agent_project(project, cx);
                 }
                 return;
             }
@@ -5467,17 +5667,22 @@ impl Shell {
         };
         let path = listing.path.clone();
         let git_detected = flow.browser_repo;
-        // Same (device, folder) already has a space → just switch to it. The
-        // engine dedupes this case too (a createSpace for a duplicate pair
-        // no-ops), so creating would leave the minted id dangling.
-        if let Some(existing) = self
-            .state
-            .read(cx)
-            .spaces
-            .iter()
-            .find(|s| s.device_id == device.id && s.path == path)
-            .map(|s| s.id.clone())
-        {
+        self.create_and_land_in_space(engine, device, path, git_detected, cx);
+    }
+
+    /// Create a space for `path` on `device` and land in it — or, when that
+    /// (device, folder) already has a space, just switch to it. The engine
+    /// dedupes this case too (a createSpace for a duplicate pair no-ops), so
+    /// creating would leave the minted id dangling.
+    fn create_and_land_in_space(
+        &mut self,
+        engine: crate::state::EngineHandle,
+        device: Device,
+        path: String,
+        git_detected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(existing) = self.add_space_existing(&device.id, &path, cx) {
             self.add_space = None;
             self.land_in_space(existing, cx);
             return;
@@ -5487,32 +5692,7 @@ impl Shell {
         };
         flow.submit_busy = true;
         flow.error = None;
-        let space_id = uuid::Uuid::new_v4().to_string();
-        // Optimistic echo: the watch frame carrying the real row replaces it
-        // by id (apply_spaces re-sorts; same-id upsert is idempotent).
-        let space = Space {
-            id: space_id.clone(),
-            device_id: device.id.clone(),
-            path: path.clone(),
-            name: None,
-            git_detected,
-            git_checked_at: None,
-            checkout_id: None,
-            created_at: Utc::now(),
-        };
-        self.state.update(cx, |s, cx| {
-            if !s.spaces.iter().any(|existing| existing.id == space.id) {
-                s.spaces.push(space);
-            }
-            cx.notify();
-        });
-        let params = serde_json::json!({
-            "op": "createSpace",
-            "spaceId": space_id,
-            "deviceId": device.id,
-            "path": path,
-            "gitDetected": git_detected,
-        });
+        let (space_id, params) = self.optimistic_space(&device, path, git_detected, cx);
         let submit_id = space_id.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::MUTATE, params).await;
@@ -5544,6 +5724,131 @@ impl Shell {
         cx.notify();
     }
 
+    /// Insert the optimistic row for a new space and build its createSpace
+    /// mutation. The watch frame carrying the real row replaces the echo by
+    /// id (apply_spaces re-sorts; same-id upsert is idempotent).
+    fn optimistic_space(
+        &mut self,
+        device: &Device,
+        path: String,
+        git_detected: bool,
+        cx: &mut Context<Self>,
+    ) -> (String, serde_json::Value) {
+        let space_id = uuid::Uuid::new_v4().to_string();
+        let space = Space {
+            id: space_id.clone(),
+            device_id: device.id.clone(),
+            path: path.clone(),
+            name: None,
+            git_detected,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        };
+        self.state.update(cx, |s, cx| {
+            if !s.spaces.iter().any(|existing| existing.id == space.id) {
+                s.spaces.push(space);
+            }
+            cx.notify();
+        });
+        let params = serde_json::json!({
+            "op": "createSpace",
+            "spaceId": space_id,
+            "deviceId": device.id,
+            "path": path,
+            "gitDetected": git_detected,
+        });
+        (space_id, params)
+    }
+
+    /// Import one agent project: add it as a space and open it.
+    fn import_agent_project(&mut self, project: AgentProject, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(flow) = self.add_space.as_ref() else {
+            return;
+        };
+        if flow.submit_busy {
+            return;
+        }
+        let Some(device) = flow.device.clone() else {
+            return;
+        };
+        self.create_and_land_in_space(engine, device, project.path, project.is_repo, cx);
+    }
+
+    /// Import every listed (query-filtered) project that isn't a space yet,
+    /// then close the flow — the new projects appear in the sidebar.
+    fn import_all_agent_projects(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(flow) = self.add_space.as_ref() else {
+            return;
+        };
+        if flow.submit_busy || flow.step != ProjectStep::Import {
+            return;
+        }
+        let Some(device) = flow.device.clone() else {
+            return;
+        };
+        let pending: Vec<AgentProject> = self
+            .add_space_import_rows(cx)
+            .into_iter()
+            .filter(|p| self.add_space_existing(&device.id, &p.path, cx).is_none())
+            .collect();
+        if pending.is_empty() {
+            self.add_space = None;
+            cx.notify();
+            return;
+        }
+        let creates: Vec<(String, serde_json::Value)> = pending
+            .into_iter()
+            .map(|p| self.optimistic_space(&device, p.path, p.is_repo, cx))
+            .collect();
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        flow.submit_busy = true;
+        flow.error = None;
+        let task = cx.spawn(async move |this, cx| {
+            let mut failed = Vec::new();
+            let mut last_error = None;
+            for (space_id, params) in creates {
+                if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                    failed.push(space_id);
+                    last_error = Some(err.to_string());
+                }
+            }
+            this.update(cx, |shell, cx| {
+                if failed.is_empty() {
+                    shell.add_space = None;
+                } else {
+                    // Roll the failed optimistic rows back; keep the flow open
+                    // with the error so the user can retry the rest.
+                    shell.state.update(cx, |s, cx| {
+                        s.spaces.retain(|space| !failed.contains(&space.id));
+                        cx.notify();
+                    });
+                    if let Some(flow) = shell.add_space.as_mut() {
+                        flow.submit_busy = false;
+                        flow.error = last_error.map(|err| {
+                            format!("{} project(s) could not be imported: {err}", failed.len())
+                                .into()
+                        });
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.submit_task = Some(task);
+        }
+        cx.notify();
+    }
+
     /// Back traverses folders, then locations, then devices.
     fn add_space_go_up(&mut self, cx: &mut Context<Self>) {
         let Some(flow) = &self.add_space else {
@@ -5552,6 +5857,7 @@ impl Shell {
         match flow.step {
             ProjectStep::Devices => return,
             ProjectStep::Locations => self.add_space_back_to(ProjectStep::Devices, cx),
+            ProjectStep::Import => self.add_space_back_to(ProjectStep::Locations, cx),
             ProjectStep::Folders => {
                 let listing = flow.browser.ready();
                 let root = flow
@@ -5612,6 +5918,7 @@ impl Shell {
                 let count = match self.add_space.as_ref().map(|f| f.step) {
                     Some(ProjectStep::Devices) => self.add_space_devices(cx).len(),
                     Some(ProjectStep::Locations) => self.add_space_locations(cx).len(),
+                    Some(ProjectStep::Import) => self.add_space_import_rows(cx).len(),
                     _ => self.add_space_filtered(cx).len(),
                 };
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
@@ -5631,7 +5938,17 @@ impl Shell {
             // subfolders; the usual target (a repo root full of subfolders)
             // is only ever "the folder you're standing in".
             popover::MenuKey::Enter => self.add_space_open_active(cx),
-            popover::MenuKey::ModEnter => self.submit_add_space(cx),
+            popover::MenuKey::ModEnter => {
+                if self
+                    .add_space
+                    .as_ref()
+                    .is_some_and(|f| f.step == ProjectStep::Import)
+                {
+                    self.import_all_agent_projects(cx);
+                } else {
+                    self.submit_add_space(cx);
+                }
+            }
             popover::MenuKey::Backspace => {
                 let empty = self
                     .add_space
@@ -5671,6 +5988,8 @@ impl Shell {
         let active = flow.active;
         let loading = matches!(flow.browser, Loadable::Idle | Loadable::Loading);
         let drives_loading = matches!(flow.drives, Loadable::Loading);
+        let agents_loading = matches!(flow.agent_projects, Loadable::Loading);
+        let import_source = flow.import_source;
         let ghost = self
             .add_space_completion(cx)
             .map(|(_, suffix)| SharedString::from(suffix));
@@ -5715,24 +6034,97 @@ impl Shell {
                 }
             }
             ProjectStep::Locations => {
-                for (ix, (name, path)) in self.add_space_locations(cx).into_iter().enumerate() {
-                    let glyph = if path.is_none() {
-                        icons::HOME
-                    } else {
-                        icons::HARD_DRIVE
+                for (ix, location) in self.add_space_locations(cx).into_iter().enumerate() {
+                    let label = location.label();
+                    let (glyph, tint, count) = match &location {
+                        LocationRow::Place { path: None, .. } => (icons::HOME, None, None),
+                        LocationRow::Place { .. } => (icons::HARD_DRIVE, None, None),
+                        LocationRow::Import { harness, count } => {
+                            let (glyph, tint) = crate::pickers::harness_brand_icon(*harness);
+                            (glyph, tint, Some(*count))
+                        }
                     };
-                    let label = name.clone();
                     rows.push(
                         row(ix)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.add_space_goto_location(name.clone(), path.clone(), cx)
+                                this.add_space_open_location(location.clone(), cx)
                             }))
-                            .child(icon(glyph).size(px(17.0)).text_color(theme.text_muted))
+                            .child(
+                                icon(glyph)
+                                    .size(px(17.0))
+                                    .text_color(tint.unwrap_or(theme.text_muted)),
+                            )
                             .child(popover::search_highlight(
                                 label.into(),
                                 Some(&query),
                                 &theme,
                             ))
+                            .when_some(count, |el, count| {
+                                el.child(div().flex_1()).child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(crate::typography::ui_rems(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(if count == 1 {
+                                            "1 project".to_string()
+                                        } else {
+                                            format!("{count} projects")
+                                        })),
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
+            }
+            ProjectStep::Import => {
+                let device_id = device.as_ref().map(|d| d.id.clone()).unwrap_or_default();
+                for (ix, project) in self.add_space_import_rows(cx).into_iter().enumerate() {
+                    let added = self
+                        .add_space_existing(&device_id, &project.path, cx)
+                        .is_some();
+                    let name = project.name.clone();
+                    let path = project.path.clone();
+                    let is_repo = project.is_repo;
+                    rows.push(
+                        row(ix)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.import_agent_project(project.clone(), cx)
+                            }))
+                            .child(
+                                icon(icons::FOLDER)
+                                    .size(px(17.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(div().flex_none().child(popover::search_highlight(
+                                name.into(),
+                                Some(&query),
+                                &theme,
+                            )))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(path)),
+                            )
+                            .when(is_repo, |el| {
+                                el.child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                )
+                            })
+                            .when(added, |el| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(crate::typography::ui_rems(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child("Added"),
+                                )
+                            })
                             .into_any_element(),
                     );
                 }
@@ -5812,10 +6204,12 @@ impl Shell {
                     ProjectStep::Locations => "No locations found",
                     ProjectStep::Folders if query.is_empty() => "No folders here",
                     ProjectStep::Folders => "No folders match",
+                    ProjectStep::Import if query.is_empty() => "No projects found",
+                    ProjectStep::Import => "No projects match",
                 },
             ));
         }
-        if step == ProjectStep::Locations && drives_loading {
+        if step == ProjectStep::Locations && (drives_loading || agents_loading) {
             results = results.child(
                 div()
                     .px(px(8.0))
@@ -5906,6 +6300,15 @@ impl Shell {
                         this.add_space_back_to(ProjectStep::Locations, cx)
                     })),
                 ));
+        }
+        if let Some(harness) = import_source {
+            let (glyph, _) = crate::pickers::harness_brand_icon(harness);
+            trail = trail.child(segment(crumb(
+                "project-crumb-import".into(),
+                format!("Import from {}", import_source_label(harness)).into(),
+                Some(glyph),
+                true,
+            )));
         }
         if let Some((name, path)) = location {
             let glyph = if path.is_none() {
@@ -6018,7 +6421,15 @@ impl Shell {
                 icons::ARROW_DOWN,
                 "Navigate",
             ))
-            .child(popover::key_hint_text(&theme, "↵", "Open"))
+            .child(popover::key_hint_text(
+                &theme,
+                "↵",
+                if step == ProjectStep::Import {
+                    "Add"
+                } else {
+                    "Open"
+                },
+            ))
             .child(popover::key_hint_text(&theme, "esc", "Close"))
             .child(div().flex_1())
             .when(step == ProjectStep::Folders, |el| {
@@ -6038,6 +6449,30 @@ impl Shell {
                     .gap(px(8.0))
                     .when(busy || listing.is_none(), |el| el.opacity(0.5))
                     .on_click(cx.listener(|this, _, _, cx| this.submit_add_space(cx)))
+                    .child(
+                        popover::key_cap(&theme)
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .child(crate::settings::badge_combo("mod-enter")),
+                    ),
+                )
+            })
+            .when(step == ProjectStep::Import, |el| {
+                el.child(
+                    popover::btn_ghost(
+                        &theme,
+                        if busy { "Importing…" } else { "Import all" },
+                        "project-import-all",
+                    )
+                    .id("project-import-all")
+                    .h(px(22.0))
+                    .py(px(0.0))
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .when(busy || empty, |el| el.opacity(0.5))
+                    .on_click(cx.listener(|this, _, _, cx| this.import_all_agent_projects(cx)))
                     .child(
                         popover::key_cap(&theme)
                             .text_size(crate::typography::ui_rems(11.0))
@@ -6440,15 +6875,13 @@ impl Shell {
 mod project_flow_tests {
     use super::*;
 
-    #[gpui::test]
-    fn devices_locations_folders_and_back_clear_stale_state(cx: &mut gpui::TestAppContext) {
-        let data = tempfile::tempdir().unwrap();
+    fn test_shell(cx: &mut gpui::TestAppContext, data: &std::path::Path) -> Entity<Shell> {
         cx.update(|cx| {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
             crate::app_menus::init(cx);
         });
-        let shell = cx.new(|cx| {
+        cx.new(|cx| {
             let state = cx.new(|_| {
                 let mut state = AppState::new();
                 state.devices = serde_json::from_value(serde_json::json!([
@@ -6461,7 +6894,7 @@ mod project_flow_tests {
             Shell::new(
                 state,
                 EngineBootConfig {
-                    data_dir: data.path().into(),
+                    data_dir: data.into(),
                     ipc_port: 0,
                     edge_url: String::new(),
                     edge_token: None,
@@ -6471,7 +6904,100 @@ mod project_flow_tests {
                 },
                 cx,
             )
+        })
+    }
+
+    fn agent_project(path: &str, is_repo: bool) -> AgentProject {
+        AgentProject {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap().into(),
+            last_used_at: None,
+            is_repo,
+        }
+    }
+
+    #[test]
+    fn same_folder_ignores_separators_and_windows_case() {
+        assert!(same_folder(r"C:\Users\Me\app", "c:/users/me/app/"));
+        assert!(same_folder("/work/app/", "/work/app"));
+        assert!(!same_folder("/work/App", "/work/app"));
+        assert!(!same_folder("/work/app", "/work/apps"));
+    }
+
+    #[gpui::test]
+    fn import_step_lists_agent_projects_and_goes_back(cx: &mut gpui::TestAppContext) {
+        let data = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, data.path());
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.spaces.push(Space {
+                    id: "existing".into(),
+                    device_id: "remote".into(),
+                    path: "/work/alpha".into(),
+                    name: None,
+                    git_detected: true,
+                    git_checked_at: None,
+                    checkout_id: None,
+                    created_at: Utc::now(),
+                });
+            });
+            shell.open_add_space(cx);
+            let search = shell.add_space.as_ref().unwrap().search.clone();
+            search.update(cx, |input, cx| input.set_text("server", cx));
+            shell.add_space_open_active(cx);
+            let flow = shell.add_space.as_mut().unwrap();
+            flow.drives = Loadable::Ready(Vec::new());
+            flow.agent_projects = Loadable::Ready(vec![AgentProjectSource {
+                harness: HarnessId::ClaudeCode,
+                projects: vec![
+                    agent_project("/work/alpha", true),
+                    agent_project("/work/beta", false),
+                ],
+            }]);
+            assert_eq!(
+                shell.add_space_locations(cx),
+                vec![
+                    LocationRow::Place {
+                        name: "Home".into(),
+                        path: None
+                    },
+                    LocationRow::Import {
+                        harness: HarnessId::ClaudeCode,
+                        count: 2
+                    },
+                ]
+            );
+            search.update(cx, |input, cx| input.set_text("claude", cx));
+            shell.add_space_open_active(cx);
+            let flow = shell.add_space.as_ref().unwrap();
+            assert_eq!(flow.step, ProjectStep::Import);
+            assert_eq!(flow.import_source, Some(HarnessId::ClaudeCode));
+            assert!(flow.search.read(cx).is_empty());
+            assert_eq!(shell.add_space_import_rows(cx).len(), 2);
+            search.update(cx, |input, cx| input.set_text("bet", cx));
+            let rows = shell.add_space_import_rows(cx);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].name, "beta");
+            // Paths match too, so a parent folder's name finds its projects.
+            search.update(cx, |input, cx| input.set_text("work", cx));
+            assert_eq!(shell.add_space_import_rows(cx).len(), 2);
+            assert_eq!(
+                shell.add_space_existing("remote", "/work/alpha/", cx),
+                Some("existing".to_string())
+            );
+            assert_eq!(shell.add_space_existing("local", "/work/alpha", cx), None);
+            shell.add_space_go_up(cx);
+            let flow = shell.add_space.as_ref().unwrap();
+            assert_eq!(flow.step, ProjectStep::Locations);
+            assert_eq!(flow.import_source, None);
+            assert!(flow.agent_projects.ready().is_some(), "kept for re-entry");
         });
+    }
+
+    #[gpui::test]
+    fn devices_locations_folders_and_back_clear_stale_state(cx: &mut gpui::TestAppContext) {
+        let data = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, data.path());
         shell.update(cx, |shell, cx| {
             shell.open_add_space(cx);
             assert_eq!(shell.add_space.as_ref().unwrap().step, ProjectStep::Devices);

@@ -439,6 +439,37 @@ pub struct DriveListing {
     pub drives: Vec<DriveEntry>,
 }
 
+/// A folder another coding agent has worked in on the device, discovered from
+/// that agent's own history (`ListAgentProjects`). Only folders that still
+/// exist are reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProject {
+    /// Absolute folder path in the device's native form.
+    pub path: String,
+    /// The folder's own name (last path component).
+    pub name: String,
+    /// When the agent last touched the folder, when its history records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub is_repo: bool,
+}
+
+/// One agent's discovered projects, most recently used first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProjectSource {
+    pub harness: HarnessId,
+    pub projects: Vec<AgentProject>,
+}
+
+/// `ListAgentProjects` reply: only agents with at least one project appear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProjectListing {
+    pub sources: Vec<AgentProjectSource>,
+}
+
 /// A workspace-relative file or directory returned by `SearchFiles`.
 /// Contents deliberately never cross this boundary: mentioning a path leaves
 /// the harness to read it through its normal workspace tools when needed.

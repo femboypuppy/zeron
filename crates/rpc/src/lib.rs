@@ -151,6 +151,9 @@ pub mod methods {
     pub const LIST_FOLDERS: &str = "ListFolders";
     /// The device's browse roots: home plus mounted drives/volumes.
     pub const LIST_DRIVES: &str = "ListDrives";
+    /// Project folders other coding agents (Claude Code, Codex, opencode, …)
+    /// have worked in on the device — the New project flow's import source.
+    pub const LIST_AGENT_PROJECTS: &str = "ListAgentProjects";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     // Device-local workspace filesystem operations. All are relay-forwardable;
