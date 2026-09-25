@@ -209,6 +209,12 @@ pub struct Chat {
     /// is only injected when the next run launches from the same cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_cwd: Option<String>,
+    /// The agent that created [`Self::harness_session_id`]. A chat can switch
+    /// agents; a session only resumes under the agent that owns it, and a
+    /// switch hands the new agent the transcript instead. `None` on rows
+    /// written before the field existed (treated as the chat's agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session_harness: Option<HarnessId>,
     /// The space this chat belongs to. Invariant: `Some` for every UI-created
     /// chat; rows with a missing/dangling space id are not rendered (the host
     /// device's repair sweep deletes its own danglers).

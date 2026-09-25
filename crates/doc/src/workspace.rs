@@ -707,6 +707,10 @@ pub(crate) struct RawChat {
     harness_session_id: Option<String>,
     #[serde(default)]
     harness_session_cwd: Option<String>,
+    /// LENIENT like `config`: an agent id this build doesn't know decodes as
+    /// unknown instead of failing the row.
+    #[serde(default, deserialize_with = "lenient_harness")]
+    harness_session_harness: Option<zeron_proto::HarnessId>,
     #[serde(default)]
     space_id: Option<String>,
     #[serde(default)]
@@ -735,6 +739,14 @@ where
     }))
 }
 
+fn lenient_harness<'de, D>(deserializer: D) -> Result<Option<zeron_proto::HarnessId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 impl From<RawChat> for Chat {
     fn from(raw: RawChat) -> Self {
         Chat {
@@ -752,6 +764,7 @@ impl From<RawChat> for Chat {
             created_at: dt(raw.created_at),
             harness_session_id: raw.harness_session_id,
             harness_session_cwd: raw.harness_session_cwd,
+            harness_session_harness: raw.harness_session_harness,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
@@ -861,6 +874,7 @@ mod tests {
             created_at: ts(2_000),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_harness: None,
             parent_chat_id: Some("parent-chat".into()),
             space_id: None,
             last_seen_at: None,

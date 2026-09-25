@@ -24,6 +24,7 @@ pub mod chat2_host;
 mod chat_persistence;
 pub mod diff_sync;
 pub mod doc_host;
+mod handoff;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;

@@ -908,6 +908,13 @@ impl RegistryDoc {
                 "harnessSessionCwd",
                 opt_str(chat.harness_session_cwd.as_deref()),
             ),
+            (
+                "harnessSessionHarness",
+                chat.harness_session_harness
+                    .map(serde_json::to_value)
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+            ),
             ("spaceId", opt_str(chat.space_id.as_deref())),
             ("lastSeenAt", opt_ms(chat.last_seen_at)),
             (
@@ -1112,11 +1119,13 @@ impl RegistryDoc {
 
     /// Host-side resume continuity. An empty `session_id` is the explicit
     /// "do not resume" tombstone written after a harness rejects a resume.
+    /// `harness` names the agent that owns the session (`None` = unknown).
     pub fn set_chat_harness_session(
         &mut self,
         chat_id: &str,
         session_id: &str,
         cwd: &str,
+        harness: Option<zeron_proto::HarnessId>,
     ) -> Result<bool, DocError> {
         if !self.row_exists(KIND_CHATS, chat_id) {
             return Ok(false);
@@ -1128,6 +1137,12 @@ impl RegistryDoc {
             fields([
                 ("harnessSessionId", json!(session_id)),
                 ("harnessSessionCwd", json!(cwd)),
+                (
+                    "harnessSessionHarness",
+                    harness
+                        .map(|h| serde_json::to_value(h).unwrap_or(Value::Null))
+                        .unwrap_or(Value::Null),
+                ),
             ]),
         );
         Ok(true)

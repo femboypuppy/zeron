@@ -661,6 +661,7 @@ impl Tools {
                 created_at: chrono::Utc::now(),
                 harness_session_id: None,
                 harness_session_cwd: None,
+                harness_session_harness: None,
                 parent_chat_id: parent_chat_id.clone(),
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,

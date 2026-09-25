@@ -1,7 +1,8 @@
 //! Composer pickers (feature-inventory §1.7): RepoPicker (recents + search +
 //! in-app folder browser + clone/create), BranchPicker (search + isolated-
-//! worktree toggle), HarnessModelPicker (harness rail + model list, harness
-//! locked once the chat exists), TraitsPicker (reasoning ladder + advertised
+//! worktree toggle), HarnessModelPicker (harness rail + model list; an
+//! existing chat can switch agents — the engine hands the conversation to the
+//! new one), TraitsPicker (reasoning ladder + advertised
 //! model options; trigger shows the non-default summary "High · 1M · Fast").
 //!
 //! All selections accumulate into a [`DraftConfig`] the composer threads into
@@ -449,7 +450,6 @@ struct ModelRowsKey {
     query: String,
     rail: ModelRail,
     effective: Option<HarnessId>,
-    locked: bool,
     catalog_rev: u64,
     selected: Option<String>,
 }
@@ -841,9 +841,33 @@ impl Pickers {
         &self.config
     }
 
-    /// Harness is locked once the chat exists (feature-inventory §1.7).
-    fn harness_locked(&self, cx: &App) -> bool {
+    /// Whether picks apply to an existing chat's row (not the new-chat draft
+    /// or the thread-naming setting).
+    fn editing_chat(&self, cx: &App) -> bool {
         self.title.is_none() && self.state.read(cx).selected_chat.is_some()
+    }
+
+    /// Move an existing chat to another agent, on `model` or that agent's
+    /// remembered one. The old agent's native session can't resume under the
+    /// new one, so the engine starts it fresh and hands it the conversation so
+    /// far (`zeron_engine::handoff`); the switch applies from the next message.
+    fn switch_chat_harness(
+        &mut self,
+        harness: HarnessId,
+        model: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let model = model.or_else(|| self.defaults.model_for(harness).map(|m| m.id.clone()));
+        self.update_chat_config(cx, move |config| {
+            config.harness = harness;
+            config.model = model;
+            config.reasoning = None;
+            config.model_options = Default::default();
+        });
+        self.ensure_models(harness, false, cx);
+        self.model_scroll_base().set_offset(gpui::Point::default());
+        self.active = self.selected_model_index(cx);
+        cx.notify();
     }
 
     /// The harnesses this picker offers: runnable ones for the composer,
@@ -1167,7 +1191,9 @@ impl Pickers {
             self.config.harness = None;
             self.model_rail = ModelRail::Harness;
         } else if kind == PickerKind::HarnessModel {
-            self.model_rail = if !self.harness_locked(cx) && !self.defaults.favorites.is_empty() {
+            // An existing chat opens on its own agent's list (its model in
+            // view); a new chat on the stars, when there are any.
+            self.model_rail = if !self.editing_chat(cx) && !self.defaults.favorites.is_empty() {
                 ModelRail::Favorites
             } else {
                 ModelRail::Harness
@@ -1651,7 +1677,10 @@ impl Pickers {
     }
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        if self.harness_locked(cx) {
+        if self.editing_chat(cx) {
+            if self.effective_harness(cx) != Some(harness) {
+                self.switch_chat_harness(harness, None, cx);
+            }
             return;
         }
         if self.config.harness != Some(harness) {
@@ -1868,10 +1897,6 @@ impl Pickers {
         {
             descriptors.insert(0, descriptor.clone());
         }
-        if self.harness_locked(cx) {
-            let effective = self.effective_harness(cx);
-            descriptors.retain(|d| Some(d.id) == effective);
-        }
         descriptors
     }
 
@@ -1881,8 +1906,7 @@ impl Pickers {
     /// A live search spans every ready harness (t3: the sidebar hides and
     /// the query ignores it); otherwise the rail selection decides —
     /// favorites across harnesses, or the effective harness's list with its
-    /// starred rows floated to the top (t3 `groupFavorites`). A locked chat
-    /// restricts every view to its own harness.
+    /// starred rows floated to the top (t3 `groupFavorites`).
     /// Cached [`Self::visible_model_rows`]: selection/highlight changes and
     /// re-renders share one flattened list until an input actually changes.
     fn model_rows(&self, cx: &App) -> std::sync::Arc<Vec<ModelRowData>> {
@@ -1890,7 +1914,6 @@ impl Pickers {
             query: self.search.read(cx).text().trim().to_string(),
             rail: self.model_rail,
             effective: self.effective_harness(cx),
-            locked: self.harness_locked(cx),
             catalog_rev: self.catalog_rev,
             selected: self.effective_model_id(cx).map(str::to_owned),
         };
@@ -2022,7 +2045,9 @@ impl Pickers {
             return;
         }
         if self.effective_harness(cx) != Some(row.harness) {
-            if self.harness_locked(cx) {
+            if self.editing_chat(cx) {
+                // One row write: the agent and its model switch together.
+                self.switch_chat_harness(row.harness, Some(row.model.id), cx);
                 return;
             }
             self.pick_harness(row.harness, cx);

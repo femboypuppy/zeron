@@ -65,6 +65,19 @@ type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnsw
 struct HarnessSessionRef {
     session_id: String,
     cwd: String,
+    /// The agent that owns the session (`None` = unknown: legacy rows and
+    /// journal-recovered ids, assumed to be the chat's agent).
+    harness: Option<HarnessId>,
+}
+
+/// What the chat's stored harness session means for a run under some agent.
+struct ResumeLookup {
+    /// The session to resume, when the run's agent owns it.
+    resume: Option<String>,
+    /// Set when a stored session belongs to a DIFFERENT agent: the chat
+    /// switched agents, so the run starts fresh with the transcript handed
+    /// over (see [`crate::handoff`]).
+    switched_from: Option<HarnessId>,
 }
 
 /// Configuration baked into a live harness runtime. The steering mailbox only
@@ -460,9 +473,35 @@ impl SessionsEngine {
         // problem now (`session/load` falls back to `session/new` internally),
         // and starting the retry fresh silently dropped a good conversation.
         let mut resume_injected = false;
+        // The prompt as the user typed it: the sidebar preview and title use
+        // it even when the agent receives a handoff preamble.
+        let user_prompt = request.prompt.clone();
         if request.resume.is_none() {
-            request.resume = self.inner.resume_for(chat_id, &request.cwd);
+            let lookup = self.inner.resume_for(chat_id, &request.cwd, harness_id);
+            request.resume = lookup.resume;
             resume_injected = request.resume.is_some();
+            // The chat switched agents: this agent starts fresh, so hand it
+            // the conversation so far. A startup retry re-sends the request
+            // it was given (already carrying the handoff).
+            if let Some(previous) = lookup.switched_from
+                && !startup_retry
+                && let Ok(entries) = handle.doc().read_entries()
+                && let Some(prompt) = crate::handoff::handoff_prompt(
+                    &entries,
+                    &user_id,
+                    Some(previous),
+                    harness_id,
+                    &request.prompt,
+                )
+            {
+                tracing::info!(
+                    chat = %chat_id,
+                    from = ?previous,
+                    to = ?harness_id,
+                    "agent switch: handing the conversation to a fresh session"
+                );
+                request.prompt = prompt;
+            }
         }
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
 
@@ -512,7 +551,7 @@ impl SessionsEngine {
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
-        self.inner.note_message(chat_id, &request.prompt);
+        self.inner.note_message(chat_id, &user_prompt);
 
         // Name the chat NOW, off the first prompt — not after the first
         // exchange completes ("called New session for a long time for no
@@ -520,7 +559,7 @@ impl SessionsEngine {
         // the Done-time call below stays as the retry for a failed
         // generation).
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate(chat_id, harness_id, &user_prompt, &request.cwd);
         }
 
         tokio::spawn(drive_run(
@@ -700,7 +739,7 @@ impl SessionsEngine {
             // same harness conversation (zeron recoverDraft, sessions.ts:538).
             if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
                 self.inner
-                    .remember_harness_session(&chat_id, &session_id, &cwd);
+                    .remember_harness_session(&chat_id, &session_id, &cwd, None);
             }
             // The revival prompt: the last user message (idempotent re-dispatch
             // under the SAME id — `write_user_message` dedupes by id, so the
@@ -1057,7 +1096,13 @@ impl Inner {
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
     /// engine restart (zeron sessions.ts:1039).
-    fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
+    fn remember_harness_session(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        harness: Option<HarnessId>,
+    ) {
         if session_id.is_empty() {
             return;
         }
@@ -1066,10 +1111,11 @@ impl Inner {
             HarnessSessionRef {
                 session_id: session_id.to_string(),
                 cwd: cwd.to_string(),
+                harness,
             },
         );
         if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, session_id, cwd);
+            ws.set_chat_harness_session(chat_id, session_id, cwd, harness);
         }
     }
 
@@ -1088,22 +1134,47 @@ impl Inner {
     /// harness session stores are keyed by cwd, so a session created elsewhere
     /// never rides `--resume`. An empty stored id is the explicit tombstone —
     /// no resume, no falling through to staler sources.
-    fn resume_for(&self, chat_id: &str, cwd: &str) -> Option<String> {
+    ///
+    /// Agent-gated too: a session only resumes under the agent that owns it.
+    /// A session owned by another agent means the chat switched agents — no
+    /// resume, and the lookup reports the previous agent for the handoff.
+    fn resume_for(&self, chat_id: &str, cwd: &str, harness: HarnessId) -> ResumeLookup {
         let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || session_cwd == cwd;
+        let decide = |session_id: String, session_cwd: &str, owner: Option<HarnessId>| {
+            if session_id.is_empty() {
+                return ResumeLookup {
+                    resume: None,
+                    switched_from: None,
+                };
+            }
+            if let Some(owner) = owner.filter(|owner| *owner != harness) {
+                return ResumeLookup {
+                    resume: None,
+                    switched_from: Some(owner),
+                };
+            }
+            ResumeLookup {
+                resume: cwd_ok(session_cwd).then_some(session_id),
+                switched_from: None,
+            }
+        };
         if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
-            return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
-                .then_some(known.session_id);
+            return decide(known.session_id, &known.cwd, known.harness);
         }
         if let Some(ws) = self.workspace()
-            && let Some((session_id, session_cwd)) = ws.chat_harness_session(chat_id)
+            && let Some((session_id, session_cwd, owner)) = ws.chat_harness_session(chat_id)
         {
-            return (!session_id.is_empty() && cwd_ok(session_cwd.as_deref().unwrap_or("")))
-                .then_some(session_id);
+            return decide(session_id, session_cwd.as_deref().unwrap_or(""), owner);
         }
-        let (session_id, session_cwd) = self.journal_harness_session(chat_id)?;
+        let Some((session_id, session_cwd)) = self.journal_harness_session(chat_id) else {
+            return ResumeLookup {
+                resume: None,
+                switched_from: None,
+            };
+        };
         // Cache the journal hit (memory + row) so later dispatches skip the scan.
-        self.remember_harness_session(chat_id, &session_id, &session_cwd);
-        cwd_ok(&session_cwd).then_some(session_id)
+        self.remember_harness_session(chat_id, &session_id, &session_cwd, None);
+        decide(session_id, &session_cwd, None)
     }
 
     /// The last harness session id named anywhere in the chat's journal, with
@@ -1511,6 +1582,8 @@ async fn drive_run(
     resume_state: RunResumeState,
 ) {
     let device_id = inner.device_id.clone();
+    // The agent that owns any session this run creates.
+    let run_harness = harness.id();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
@@ -2277,13 +2350,13 @@ async fn drive_run(
                 saw_session_started = true;
                 // The event's own cwd (where the harness actually created the
                 // session) scopes the stored id, not the request's.
-                inner.remember_harness_session(&chat_id, session_id, cwd);
+                inner.remember_harness_session(&chat_id, session_id, cwd, Some(run_harness));
             }
             AgentEvent::Done {
                 session_id: Some(session_id),
                 ..
             } => {
-                inner.remember_harness_session(&chat_id, session_id, &run_cwd);
+                inner.remember_harness_session(&chat_id, session_id, &run_cwd, Some(run_harness));
             }
             AgentEvent::InputRequested { .. } => {
                 // Known-id guaranteed: the unknown-id twin was dropped above,

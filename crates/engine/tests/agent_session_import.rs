@@ -102,7 +102,11 @@ async fn claude_conversation_imports_as_a_resumable_chat() {
     assert_eq!(chat.cwd.as_deref(), Some(cwd.as_str()));
     assert_eq!(
         core.workspace.chat_harness_session(&imported.chat_id),
-        Some(("sess-1".to_string(), Some(cwd.clone()))),
+        Some((
+            "sess-1".to_string(),
+            Some(cwd.clone()),
+            Some(HarnessId::ClaudeCode)
+        )),
         "the next run resumes the native session from the same cwd"
     );
 

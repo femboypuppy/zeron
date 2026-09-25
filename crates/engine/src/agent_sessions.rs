@@ -228,6 +228,7 @@ pub fn import_session_with(
         // run launches from the row's `cwd` — so both carry the same string.
         harness_session_id: Some(session_id.to_string()),
         harness_session_cwd: Some(cwd),
+        harness_session_harness: Some(harness),
         space_id: Some(space_id.clone()),
         // Already read: an import must not raise a "finished, unseen" badge.
         last_seen_at: Some(last_at),
