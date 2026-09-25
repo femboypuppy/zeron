@@ -223,6 +223,8 @@ pub struct AppearancePage {
     light_theme_select: widgets::SelectState,
     dark_theme_select: widgets::SelectState,
     surface_select: widgets::SelectState,
+    frost_select: widgets::SelectState,
+    backdrop_select: widgets::SelectState,
     background_effect_select: widgets::SelectState,
     import_dialog: Option<ImportDialog>,
     review_entry: Option<String>,
@@ -485,6 +487,8 @@ impl AppearancePage {
             light_theme_select: widgets::SelectState::default(),
             dark_theme_select: widgets::SelectState::default(),
             surface_select: widgets::SelectState::default(),
+            frost_select: widgets::SelectState::default(),
+            backdrop_select: widgets::SelectState::default(),
             background_effect_select: widgets::SelectState::default(),
             import_dialog: None,
             review_entry: None,
@@ -2650,6 +2654,50 @@ impl Render for AppearancePage {
                 cx.notify();
             })
             .render(&self.surface_select, cx);
+        let current_frost = appearance::frost(cx);
+        let frost_control =
+            widgets::select("appearance-frost", "Frost strength", &theme, |page: &mut Self| {
+                &mut page.frost_select
+            })
+            .options(
+                crate::settings::FrostStrength::ALL
+                    .into_iter()
+                    .map(|frost| widgets::SelectOption::new(frost.label())),
+                crate::settings::FrostStrength::ALL
+                    .into_iter()
+                    .position(|frost| frost == current_frost)
+                    .unwrap_or_default(),
+            )
+            .width(148.0)
+            .on_select(|_, ix, _, cx| {
+                appearance::set_frost(crate::settings::FrostStrength::ALL[ix], cx);
+                cx.notify();
+            })
+            .render(&self.frost_select, cx);
+        let current_backdrop = crate::settings::current(cx).frost_backdrop;
+        let backdrop_control =
+            widgets::select("appearance-frost-backdrop", "Frost backdrop", &theme, |page: &mut Self| {
+                &mut page.backdrop_select
+            })
+            .options(
+                crate::settings::FrostBackdrop::ALL
+                    .into_iter()
+                    .map(|backdrop| widgets::SelectOption::new(backdrop.label())),
+                crate::settings::FrostBackdrop::ALL
+                    .into_iter()
+                    .position(|backdrop| backdrop == current_backdrop)
+                    .unwrap_or_default(),
+            )
+            .width(148.0)
+            .on_select(|_, ix, _, cx| {
+                let backdrop = crate::settings::FrostBackdrop::ALL[ix];
+                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                    settings.frost_backdrop = backdrop;
+                });
+                cx.refresh_windows();
+                cx.notify();
+            })
+            .render(&self.backdrop_select, cx);
         let mut settings_rows = theme_rows;
         settings_rows.push(
             widgets::card_row(&theme, false)
@@ -2702,6 +2750,56 @@ impl Render for AppearancePage {
                 .child(surface_control)
                 .into_any_element(),
         );
+        // Only macOS and Windows blur the desktop behind the window.
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            let helper = if theme.surface_treatment == SurfaceTreatment::Frosted {
+                "How much of the blurred desktop shows through the window."
+            } else {
+                "Applies while Glass is frosted."
+            };
+            settings_rows.push(
+                widgets::card_row(&theme, false)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.0))
+                            .child(widgets::row_title(&theme, "Frost strength"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![div().child(helper).into_any_element()],
+                            )),
+                    )
+                    .child(frost_control)
+                    .into_any_element(),
+            );
+        }
+        // Windows' own backdrop blur falls back to a flat tint on some
+        // systems; the wallpaper frost is painted by Zeron and always shows.
+        if cfg!(target_os = "windows") {
+            let helper = match current_backdrop {
+                crate::settings::FrostBackdrop::Wallpaper => {
+                    "A blurred copy of your desktop wallpaper, painted by Zeron."
+                }
+                crate::settings::FrostBackdrop::System => {
+                    "Windows' live blur. Some systems show a flat colour instead."
+                }
+            };
+            settings_rows.push(
+                widgets::card_row(&theme, false)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.0))
+                            .child(widgets::row_title(&theme, "Frost backdrop"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![div().child(helper).into_any_element()],
+                            )),
+                    )
+                    .child(backdrop_control)
+                    .into_any_element(),
+            );
+        }
         let background_available = current_background
             .as_ref()
             .is_some_and(|background| Path::new(&background.path).is_file());
@@ -3298,6 +3396,7 @@ mod tests {
                 ThemeSelection::default(),
                 AccentSelection::default(),
                 SurfacePreference::Opaque,
+                crate::settings::FrostStrength::Subtle,
                 cx,
             );
         });

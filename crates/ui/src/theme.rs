@@ -602,6 +602,9 @@ pub struct Theme {
     /// The effective treatment after applying [`Self::surface_preference`] to
     /// the selected variant's recommendation.
     pub surface_treatment: SurfaceTreatment,
+    /// The user's frost strength as window-tint coverage (Settings →
+    /// Appearance); `None` keeps the contrast-checked platform default.
+    pub glass_alpha_override: Option<f32>,
     /// The selected interactive accent used to build this theme.
     pub accent_color: AccentColor,
 
@@ -850,6 +853,11 @@ impl Theme {
     pub fn glass(&self) -> Hsla {
         if self.surface_treatment == SurfaceTreatment::Opaque {
             return self.surface;
+        }
+        // An explicit strength is the user's trade: a visibly frosted window
+        // over guaranteed contrast on the brightest wallpaper.
+        if let Some(alpha) = self.glass_alpha_override {
+            return self.surface.opacity(alpha);
         }
         let base = match self.appearance {
             Appearance::Dark => Self::GLASS_ALPHA,
@@ -1151,6 +1159,7 @@ impl Theme {
             accent_selection: AccentSelection::Preset(accent_color.into()),
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
+            glass_alpha_override: None,
             accent_color,
             bg: grey(6),       // main panel — sampled #060606
             surface: grey(13), // shell / sidebar — sampled #0d0d0d
@@ -1231,6 +1240,7 @@ impl Theme {
             accent_selection: AccentSelection::Preset(accent_color.into()),
             surface_preference: SurfacePreference::ThemeDefault,
             surface_treatment: SurfaceTreatment::Frosted,
+            glass_alpha_override: None,
             accent_color,
             bg: grey(0xff), // main panel — clean white
             // Deeper than ~neutral-100 looks on paper: the content card is pure
@@ -1561,6 +1571,21 @@ impl Theme {
         if changed || force_generation {
             bump_style_generation();
         }
+    }
+
+    /// Apply the user's frost strength to the installed theme. Only macOS and
+    /// Windows blur the desktop behind the window; elsewhere the glass stays
+    /// opaque and the strength has nothing to show through.
+    pub fn set_glass_alpha_override(alpha: Option<f32>, cx: &mut App) {
+        let alpha = alpha.filter(|_| cfg!(any(target_os = "macos", target_os = "windows")));
+        let Some(theme) = cx.try_global::<Theme>() else {
+            return;
+        };
+        if theme.glass_alpha_override == alpha {
+            return;
+        }
+        cx.global_mut::<Theme>().glass_alpha_override = alpha;
+        bump_style_generation();
     }
 
     /// Read the theme global.
@@ -2061,6 +2086,47 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AccentColor>(r#""teal""#).unwrap(),
             AccentColor::Cyan
+        );
+    }
+
+    #[test]
+    fn frost_strength_sets_the_window_tint() {
+        use crate::settings::FrostStrength;
+        let mut theme = Theme::dark();
+        assert_eq!(theme.surface_treatment, SurfaceTreatment::Frosted);
+        let default_alpha = theme.glass().a;
+        // Each stronger level lets more of the blurred desktop through.
+        let alphas: Vec<f32> = FrostStrength::ALL
+            .into_iter()
+            .map(|frost| {
+                theme.glass_alpha_override = frost.glass_alpha();
+                theme.glass().a
+            })
+            .collect();
+        assert_eq!(alphas[0], default_alpha, "Subtle keeps the theme default");
+        assert!(alphas.windows(2).all(|pair| pair[1] < pair[0]));
+        theme.glass_alpha_override = Some(0.45);
+        assert!((theme.glass().a - 0.45).abs() < f32::EPSILON);
+        assert!(theme.is_glass());
+        // Opaque surfaces ignore the strength entirely.
+        theme.surface_treatment = SurfaceTreatment::Opaque;
+        assert_eq!(theme.glass(), theme.surface);
+    }
+
+    #[test]
+    fn frost_strength_round_trips_and_defaults_per_platform() {
+        use crate::settings::FrostStrength;
+        for frost in FrostStrength::ALL {
+            let json = serde_json::to_string(&frost).unwrap();
+            assert_eq!(serde_json::from_str::<FrostStrength>(&json).unwrap(), frost);
+        }
+        assert_eq!(
+            FrostStrength::default(),
+            if cfg!(target_os = "windows") {
+                FrostStrength::Strong
+            } else {
+                FrostStrength::Subtle
+            }
         );
     }
 

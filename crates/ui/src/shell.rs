@@ -3820,6 +3820,7 @@ impl Shell {
         self.settings.theme_selection = crate::appearance::themes(cx);
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
+        self.settings.frost_strength = crate::appearance::frost(cx);
         self.sync_independent_settings(cx);
         settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
     }
@@ -3843,6 +3844,8 @@ impl Shell {
         self.settings.code_font_size = current.code_font_size;
         self.settings.transcript_width = current.transcript_width;
         self.settings.skill_completion_by_harness = current.skill_completion_by_harness;
+        self.settings.model_preferences_by_harness = current.model_preferences_by_harness;
+        self.settings.frost_backdrop = current.frost_backdrop;
         self.settings.skills_in_slash_menu = current.skills_in_slash_menu;
     }
 
@@ -10782,11 +10785,23 @@ impl Render for Shell {
         self.settings.theme_selection = crate::appearance::themes(cx);
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
+        self.settings.frost_strength = crate::appearance::frost(cx);
         self.sync_independent_settings(cx);
         let theme = Theme::of(cx);
         // The shell frost sits over native desktop blur on macOS and Windows.
         // Content surfaces add their own backgrounds over this shared tint.
         let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
+        // Windows: Zeron paints the frost's backdrop itself — the blurred
+        // wallpaper, beneath the same tint — because DWM's backdrop blur
+        // falls back to a flat colour on some systems.
+        let wallpaper_frost = (cfg!(target_os = "windows")
+            && theme.is_glass()
+            && self.settings.frost_backdrop == settings::FrostBackdrop::Wallpaper)
+            .then(|| crate::wallpaper_frost::backdrop(window, cx))
+            .flatten();
+        // With the wallpaper layer present the tint moves onto its own layer
+        // above it; otherwise the root paints the tint directly.
+        let root_tint = wallpaper_frost.is_none().then_some(frost);
         let (workspace_scope, auth) = {
             let state = self.state.read(cx);
             (state.workspace_scope, state.auth.clone())
@@ -10951,7 +10966,11 @@ impl Render for Shell {
             .flex()
             .flex_row()
             .size_full()
-            .bg(frost)
+            .when_some(wallpaper_frost, |root, wallpaper| {
+                root.child(wallpaper)
+                    .child(div().absolute().inset_0().bg(frost))
+            })
+            .when_some(root_tint, |root, tint| root.bg(tint))
             // Linux CSD: a floating window rounds its corners against the
             // desktop (the window composites with alpha — see
             // `Theme::window_background_appearance`); tiled/maximized keeps

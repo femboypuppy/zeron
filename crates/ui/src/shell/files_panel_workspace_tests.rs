@@ -177,6 +177,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 settings.theme_selection.clone(),
                 settings.accent,
                 settings.surface,
+                settings.frost_strength,
                 cx,
             );
             crate::history::init(

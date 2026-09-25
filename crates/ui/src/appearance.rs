@@ -70,6 +70,7 @@ pub struct AppearanceState {
     pub themes: ThemeSelection,
     pub accent: AccentSelection,
     pub surface: SurfacePreference,
+    pub frost: crate::settings::FrostStrength,
 }
 
 impl Global for AppearanceState {}
@@ -91,6 +92,7 @@ pub fn init(
     themes: ThemeSelection,
     accent: AccentSelection,
     surface: SurfacePreference,
+    frost: crate::settings::FrostStrength,
     cx: &mut App,
 ) {
     let system = Appearance::from_window(cx.window_appearance());
@@ -101,6 +103,7 @@ pub fn init(
         themes: themes.clone(),
         accent,
         surface,
+        frost,
     });
     sync_ns_appearance(mode);
     let appearance = resolve(mode, system);
@@ -111,6 +114,7 @@ pub fn init(
         surface,
         cx,
     );
+    Theme::set_glass_alpha_override(frost.glass_alpha(), cx);
 }
 
 /// The mode currently in effect (defaults to `System` before [`init`]).
@@ -135,6 +139,12 @@ pub fn accent(cx: &App) -> AccentSelection {
 pub fn surface(cx: &App) -> SurfacePreference {
     cx.try_global::<AppearanceState>()
         .map(|state| state.surface)
+        .unwrap_or_default()
+}
+
+pub fn frost(cx: &App) -> crate::settings::FrostStrength {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.frost)
         .unwrap_or_default()
 }
 
@@ -206,6 +216,22 @@ pub fn set_surface(surface: SurfacePreference, cx: &mut App) {
     });
 }
 
+/// Change how strongly the window glass shows the blurred desktop.
+pub fn set_frost(frost: crate::settings::FrostStrength, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let state = cx.global_mut::<AppearanceState>();
+    if state.frost == frost {
+        return;
+    }
+    state.frost = frost;
+    apply(cx);
+    settings::update(SavePolicy::Immediate, cx, |settings| {
+        settings.frost_strength = frost;
+    });
+}
+
 /// Subscribe a window to OS appearance changes. The returned [`Subscription`]
 /// must outlive the window — callers typically `.detach()` it.
 ///
@@ -253,6 +279,7 @@ pub fn apply(cx: &mut App) {
     let wanted = resolve(state.mode, state.system);
     let accent = state.accent;
     let surface = state.surface;
+    let frost_alpha = state.frost.glass_alpha();
     let variant_id = state.themes.variant_id(model_appearance(wanted)).to_owned();
     let changed = !cx.try_global::<Theme>().is_some_and(|theme| {
         theme.appearance == wanted
@@ -260,9 +287,15 @@ pub fn apply(cx: &mut App) {
             && theme.accent_selection == accent
             && theme.surface_preference == surface
     });
+    let frost_changed = cx
+        .try_global::<Theme>()
+        .is_some_and(|theme| theme.glass_alpha_override != frost_alpha);
     if changed {
         tracing::debug!(?wanted, %variant_id, "appearance: installing palette");
         Theme::install_selection(wanted, &variant_id, accent, surface, cx);
+    }
+    Theme::set_glass_alpha_override(frost_alpha, cx);
+    if changed || frost_changed {
         cx.refresh_windows();
     }
     // Unconditional, even when the palette did not move: this is the only thing
@@ -285,8 +318,10 @@ pub fn apply_registry_change(cx: &mut App) {
     let wanted = resolve(state.mode, state.system);
     let accent = state.accent;
     let surface = state.surface;
+    let frost_alpha = state.frost.glass_alpha();
     let variant_id = state.themes.variant_id(model_appearance(wanted)).to_owned();
     Theme::reinstall_selection(wanted, &variant_id, accent, surface, cx);
+    Theme::set_glass_alpha_override(frost_alpha, cx);
     cx.refresh_windows();
     reapply_window_background(cx);
 }

@@ -38,6 +38,8 @@ use crate::theme::Theme;
 
 #[path = "completion.rs"]
 mod completion;
+#[path = "models.rs"]
+mod models;
 
 /// Left inset of an expanded provider's details: the header trigger's
 /// padding, brand tile and gap, so the details start on the title's edge.
@@ -113,6 +115,12 @@ pub struct HarnessesPage {
     /// The expanded provider's Accounts section — one page, retargeted as
     /// providers expand, so every provider shares the same sign-in flow.
     accounts_page: Option<Entity<AccountsPage>>,
+    /// Model catalogs for the Models section, per agent on the target device.
+    models: std::collections::HashMap<HarnessId, Loadable<Vec<zeron_proto::Model>>>,
+    model_tasks: std::collections::HashMap<HarnessId, Task<()>>,
+    custom_model: Option<models::CustomModelDialog>,
+    /// The Models row being dragged into a new place, if any.
+    model_drag: Option<models::ModelDrag>,
 }
 
 impl HarnessesPage {
@@ -130,6 +138,10 @@ impl HarnessesPage {
             install_task: None,
             expanded_harness: None,
             accounts_page: None,
+            models: Default::default(),
+            model_tasks: Default::default(),
+            custom_model: None,
+            model_drag: None,
         };
         page.load(cx);
         page
@@ -147,6 +159,7 @@ impl HarnessesPage {
             self.expanded_harness = None;
         } else {
             self.expanded_harness = Some(harness);
+            self.load_models(harness, false, cx);
             if accounts::signs_in(harness) {
                 if let Some(accounts) = &self.accounts_page {
                     accounts.update(cx, |page, cx| page.set_embedded_harness(harness, cx));
@@ -181,6 +194,7 @@ impl HarnessesPage {
             .flex()
             .flex_col()
             .gap(px(20.0))
+            .child(self.render_models_for(harness, theme, cx))
             .child(self.render_completion_for(harness, theme, cx))
             .when_some(accounts, |details, accounts| details.child(accounts));
         if motion::reduced_motion(cx) {
@@ -216,6 +230,12 @@ impl HarnessesPage {
         }
         self.error = None;
         self.harnesses = Loadable::Idle;
+        // Catalogs are per device too: the expanded agent reloads from the new one.
+        self.models.clear();
+        self.model_tasks.clear();
+        if let Some(harness) = self.expanded_harness {
+            self.load_models(harness, false, cx);
+        }
         self.load(cx);
         cx.notify();
     }
@@ -664,7 +684,9 @@ impl popover::ScrollRailHost for HarnessesPage {
 }
 
 impl Render for HarnessesPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.settle_model_drag(cx);
+        let custom_model_dialog = self.render_custom_model_dialog(window, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let body: gpui::AnyElement = match &self.harnesses {
             Loadable::Idle | Loadable::Loading => widgets::section_card(&theme)
@@ -743,6 +765,7 @@ impl Render for HarnessesPage {
                 .fade_overflow_y(&self.scroll.scroll),
             )
             .children(scrollbar)
+            .children(custom_model_dialog)
     }
 }
 

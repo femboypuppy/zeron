@@ -83,6 +83,19 @@ pub fn bump_harness_catalog(cx: &mut App) {
     cx.default_global::<HarnessCatalogChanged>();
 }
 
+/// Marker global: [`bump_model_preferences`] pokes it after Settings →
+/// Providers → Models edits, and every [`Pickers`] re-applies the stored
+/// preferences to the catalogs it already holds (no engine round trip).
+#[derive(Default)]
+pub struct ModelPreferencesChanged;
+
+impl gpui::Global for ModelPreferencesChanged {}
+
+/// Notify all pickers that some agent's model preferences changed.
+pub fn bump_model_preferences(cx: &mut App) {
+    cx.default_global::<ModelPreferencesChanged>();
+}
+
 // ---------------------------------------------------------------------------
 // Draft config (what the pickers accumulate)
 // ---------------------------------------------------------------------------
@@ -541,6 +554,9 @@ pub struct Pickers {
     setting_scroll: gpui::ScrollHandle,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
+    /// Each harness's catalog as loaded, before the user's model preferences
+    /// ([`crate::settings::ModelPreferences::apply`]) produced `models`.
+    raw_models: HashMap<HarnessId, Vec<Model>>,
     model_refresh_errors: HashMap<HarnessId, String>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
@@ -592,6 +608,7 @@ pub struct Pickers {
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
+    _model_preferences_observe: Subscription,
 }
 
 impl Pickers {
@@ -703,6 +720,10 @@ impl Pickers {
         // A Settings → Providers toggle changed some device's enabled set:
         // force-refresh the cached catalog so the rail/chips follow without a
         // restart (stale rows stay visible while the reload runs).
+        let model_preferences_observe =
+            cx.observe_global::<ModelPreferencesChanged>(|this: &mut Self, cx| {
+                this.reapply_model_preferences(cx);
+            });
         let catalog_observe = cx.observe_global::<HarnessCatalogChanged>(|this: &mut Self, cx| {
             this.ensure_harnesses(true, cx);
             cx.notify();
@@ -762,6 +783,7 @@ impl Pickers {
             setting_scroll: gpui::ScrollHandle::new(),
             harnesses: Loadable::Idle,
             models: HashMap::new(),
+            raw_models: HashMap::new(),
             model_refresh_errors: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
@@ -785,6 +807,7 @@ impl Pickers {
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
+            _model_preferences_observe: model_preferences_observe,
         }
     }
 
@@ -1408,14 +1431,22 @@ impl Pickers {
             cx.notify();
             return;
         }
-        if let Loadable::Ready(models) = &loaded {
-            let fresh = self
-                .defaults
-                .remember_labels(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
-            if fresh {
-                self.save_defaults();
+        let loaded = match loaded {
+            Loadable::Ready(models) => {
+                self.raw_models.insert(harness, models.clone());
+                let models = crate::settings::current(cx)
+                    .model_preferences(harness)
+                    .apply(models);
+                let fresh = self
+                    .defaults
+                    .remember_labels(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
+                if fresh {
+                    self.save_defaults();
+                }
+                Loadable::Ready(models)
             }
-        }
+            other => other,
+        };
         self.models.insert(harness, loaded);
         self.catalog_rev += 1;
         // A list that landed while its popover is open re-anchors the
@@ -1426,6 +1457,26 @@ impl Pickers {
         {
             self.active = self.selected_model_index(cx);
         }
+        cx.notify();
+    }
+
+    /// Re-derive every loaded catalog from its raw rows after the user's
+    /// model preferences changed (hidden, order, custom models).
+    fn reapply_model_preferences(&mut self, cx: &mut Context<Self>) {
+        let settings = crate::settings::current(cx);
+        let mut labels = Vec::new();
+        for (harness, raw) in &self.raw_models {
+            let models = settings.model_preferences(*harness).apply(raw.clone());
+            labels.extend(models.iter().map(|m| (m.id.clone(), m.label.clone())));
+            self.models.insert(*harness, Loadable::Ready(models));
+        }
+        if self
+            .defaults
+            .remember_labels(labels.iter().map(|(id, label)| (id.as_str(), label.as_str())))
+        {
+            self.save_defaults();
+        }
+        self.catalog_rev += 1;
         cx.notify();
     }
 
@@ -1865,16 +1916,22 @@ impl Pickers {
             .map(|f| (f.harness, f.model.as_str()))
             .collect();
         let query = self.search.read(cx).text().trim().to_string();
+        let settings = crate::settings::current(cx);
         let mut rows = scoped_model_rows(
             &query,
             self.model_rail,
             effective,
             &descriptors,
             |harness| {
+                // Hidden models sort last (`ModelPreferences::apply`): the
+                // lists show only the rows before them.
                 self.models
                     .get(&harness)
                     .and_then(|l| l.ready())
-                    .map(|models| models.as_slice())
+                    .map(|models| {
+                        let visible = settings.model_preferences(harness).visible_len(models);
+                        &models[..visible]
+                    })
             },
             |harness, model| favorites.contains(&(harness, model)),
         );
@@ -2498,10 +2555,10 @@ impl Pickers {
             cx.stop_propagation();
             return;
         }
-        // ⌘1…⌘9 jump-picks the Nth visible model row (t3 modelPickerKeys;
-        // the chips on the rows advertise these).
+        // ⌘1…⌘9 (Ctrl off macOS) jump-picks the Nth visible model row (t3
+        // modelPickerKeys; the chips on the rows advertise these).
         if self.open_kind() == Some(PickerKind::HarnessModel)
-            && event.keystroke.modifiers.platform
+            && event.keystroke.modifiers.secondary()
             && let Ok(n) = event.keystroke.key.parse::<usize>()
             && (1..=9).contains(&n)
         {
@@ -4020,7 +4077,10 @@ impl Pickers {
             }))
             .child(body);
         if ix < 9 {
-            el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
+            // The platform's spelling of the jump chord: ⌘1 on macOS, Ctrl+1
+            // elsewhere (the Windows key is the OS's taskbar chord).
+            let chord = crate::settings::badge_combo(&format!("mod-{}", ix + 1));
+            el = el.child(popover::kbd_hint(&theme, &chord));
         }
         el = el.child(
             div()

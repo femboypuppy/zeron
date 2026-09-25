@@ -645,6 +645,215 @@ impl SkillCompletionSettings {
     }
 }
 
+/// How much of the blurred desktop the window glass lets through, on the
+/// platforms whose window is blurred (macOS vibrancy, Windows Acrylic).
+/// `Subtle` keeps the theme's contrast-checked tint; the others trade some
+/// text contrast on bright wallpapers for a visibly frosted window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FrostStrength {
+    Subtle,
+    Medium,
+    Strong,
+    Maximum,
+}
+
+impl FrostStrength {
+    pub const ALL: [Self; 4] = [Self::Subtle, Self::Medium, Self::Strong, Self::Maximum];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Subtle => "Subtle",
+            Self::Medium => "Medium",
+            Self::Strong => "Strong",
+            Self::Maximum => "Maximum",
+        }
+    }
+
+    /// The window tint's coverage over the blur, or `None` for the theme's
+    /// own contrast-checked default.
+    pub fn glass_alpha(self) -> Option<f32> {
+        match self {
+            Self::Subtle => None,
+            Self::Medium => Some(0.62),
+            Self::Strong => Some(0.45),
+            Self::Maximum => Some(0.28),
+        }
+    }
+}
+
+impl Default for FrostStrength {
+    /// Windows' Acrylic reads as barely-there under the default tint, so
+    /// frost starts visibly stronger there.
+    fn default() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Strong
+        } else {
+            Self::Subtle
+        }
+    }
+}
+
+/// Where the window's frost comes from on Windows: Zeron's blurred copy of
+/// the desktop wallpaper ([`crate::wallpaper_frost`]), or DWM's own backdrop
+/// blur — which some systems silently replace with a flat tint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FrostBackdrop {
+    #[default]
+    Wallpaper,
+    System,
+}
+
+impl FrostBackdrop {
+    pub const ALL: [Self; 2] = [Self::Wallpaper, Self::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wallpaper => "Wallpaper",
+            Self::System => "Windows blur",
+        }
+    }
+}
+
+/// One agent's model list preferences (Settings → Providers → Models): the
+/// catalog models the picker hides, the order it lists them in, and models
+/// the user added by id. Device-local, like the rest of `ui-settings.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ModelPreferences {
+    /// Model ids kept out of the picker. Chats already on one still resolve.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
+    /// Ids in the user's order; models not named keep catalog order after them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    /// User-added models, shown under `label` and run as `id`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub custom: Vec<CustomModel>,
+}
+
+/// A model the user added by its backend id (e.g. `claude-mythos-5-1`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModel {
+    pub id: String,
+    pub label: String,
+}
+
+/// Description on a custom model's row, telling it apart from catalog models.
+pub const CUSTOM_MODEL_DESCRIPTION: &str = "Custom model";
+
+impl ModelPreferences {
+    pub fn is_hidden(&self, id: &str) -> bool {
+        self.hidden.iter().any(|hidden| hidden == id)
+    }
+
+    pub fn is_custom(&self, id: &str) -> bool {
+        self.custom.iter().any(|custom| custom.id == id)
+    }
+
+    /// The catalog as the picker lists it: custom models merged in (one that
+    /// names a catalog id relabels that row), the user's order first, and
+    /// hidden rows moved to the end — so the first row, the harness default,
+    /// is always the first visible model.
+    pub fn apply(&self, mut models: Vec<zeron_proto::Model>) -> Vec<zeron_proto::Model> {
+        for custom in &self.custom {
+            match models.iter_mut().find(|model| model.id == custom.id) {
+                Some(model) => model.label = custom.label.clone(),
+                None => models.push(zeron_proto::Model {
+                    id: custom.id.clone(),
+                    label: custom.label.clone(),
+                    description: Some(CUSTOM_MODEL_DESCRIPTION.into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                }),
+            }
+        }
+        let rank = |model: &zeron_proto::Model| {
+            (
+                self.is_hidden(&model.id),
+                self.order
+                    .iter()
+                    .position(|id| *id == model.id)
+                    .unwrap_or(usize::MAX),
+            )
+        };
+        models.sort_by_key(rank);
+        models
+    }
+
+    /// How many leading rows of an [`Self::apply`]'d list are visible.
+    pub fn visible_len(&self, models: &[zeron_proto::Model]) -> usize {
+        models
+            .iter()
+            .position(|model| self.is_hidden(&model.id))
+            .unwrap_or(models.len())
+    }
+
+    pub fn set_hidden(&mut self, id: &str, hidden: bool) {
+        self.hidden.retain(|existing| existing != id);
+        if hidden {
+            self.hidden.push(id.to_string());
+        }
+    }
+
+    /// Move the model at `from` to `to` within `listed` (the visible order
+    /// the user sees) and pin that whole order.
+    pub fn reorder(&mut self, listed: &[String], from: usize, to: usize) {
+        if from == to || from >= listed.len() || to >= listed.len() {
+            return;
+        }
+        let mut order = listed.to_vec();
+        let id = order.remove(from);
+        order.insert(to, id);
+        self.order = order;
+    }
+
+    /// Edit a custom model: a new display name and/or backend id. A changed
+    /// id keeps the model's place in the order and its hidden state.
+    pub fn edit_custom(&mut self, old_id: &str, new_id: &str, label: &str) {
+        if old_id != new_id {
+            self.custom.retain(|custom| custom.id != new_id);
+            for id in self.hidden.iter_mut().chain(self.order.iter_mut()) {
+                if id == old_id {
+                    *id = new_id.to_string();
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            self.hidden.retain(|id| seen.insert(id.clone()));
+            let mut seen = std::collections::HashSet::new();
+            self.order.retain(|id| seen.insert(id.clone()));
+            if let Some(custom) = self.custom.iter_mut().find(|custom| custom.id == old_id) {
+                custom.id = new_id.to_string();
+            }
+        }
+        self.upsert_custom(new_id, label);
+    }
+
+    /// Add a custom model, or rename the one already using `id`.
+    pub fn upsert_custom(&mut self, id: &str, label: &str) {
+        let label = if label.trim().is_empty() {
+            id
+        } else {
+            label.trim()
+        };
+        match self.custom.iter_mut().find(|custom| custom.id == id) {
+            Some(custom) => custom.label = label.to_string(),
+            None => self.custom.push(CustomModel {
+                id: id.to_string(),
+                label: label.to_string(),
+            }),
+        }
+    }
+
+    pub fn remove_custom(&mut self, id: &str) {
+        self.custom.retain(|custom| custom.id != id);
+        self.hidden.retain(|existing| existing != id);
+        self.order.retain(|existing| existing != id);
+    }
+}
+
 pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
     (zeron_proto::HarnessId::Antigravity, "Antigravity"),
     (zeron_proto::HarnessId::ClaudeCode, "Claude Code"),
@@ -668,6 +877,9 @@ pub struct UiSettings {
     pub skills_in_slash_menu: bool,
     pub skill_completion_by_harness:
         std::collections::HashMap<zeron_proto::HarnessId, SkillCompletionSettings>,
+    /// Per-agent model picker preferences: hidden models, order, custom ids.
+    pub model_preferences_by_harness:
+        std::collections::HashMap<zeron_proto::HarnessId, ModelPreferences>,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
@@ -805,6 +1017,10 @@ pub struct UiSettings {
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
     pub surface: zeron_theme::SurfacePreference,
+    /// How strongly the window glass shows the blurred desktop.
+    pub frost_strength: FrostStrength,
+    /// Windows: what the window glass shows through (wallpaper or DWM blur).
+    pub frost_backdrop: FrostBackdrop,
     /// Optional device-local artwork behind the blank new-thread composer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_thread_composer_background: Option<NewThreadComposerBackground>,
@@ -855,6 +1071,7 @@ impl Default for UiSettings {
             composer_send_behavior: ComposerSendBehavior::default(),
             skills_in_slash_menu: false,
             skill_completion_by_harness: Default::default(),
+            model_preferences_by_harness: Default::default(),
             appshots_enabled: false,
             appshot_sound_enabled: true,
             appshot_destination: crate::appshots::AppshotDestination::Automatic,
@@ -882,6 +1099,8 @@ impl Default for UiSettings {
             files_show_all: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
+            frost_strength: FrostStrength::default(),
+            frost_backdrop: FrostBackdrop::default(),
             new_thread_composer_background: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             legacy_accent_color: None,
@@ -1388,6 +1607,13 @@ impl UiSettings {
         self.sidebar_pinned_session_ids_by_profile
             .entry(profile_key)
             .or_default()
+    }
+
+    pub fn model_preferences(&self, harness: zeron_proto::HarnessId) -> ModelPreferences {
+        self.model_preferences_by_harness
+            .get(&harness)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn skill_completion(&self, harness: zeron_proto::HarnessId) -> SkillCompletionSettings {
@@ -2199,6 +2425,7 @@ mod tests {
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             skills_in_slash_menu: true,
             skill_completion_by_harness: Default::default(),
+            model_preferences_by_harness: Default::default(),
             appshots_enabled: false,
             appshot_sound_enabled: true,
             // The destination is only persisted where Appshots exist (macOS and
@@ -2248,6 +2475,8 @@ mod tests {
             files_show_all: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
+            frost_strength: FrostStrength::default(),
+            frost_backdrop: FrostBackdrop::default(),
             new_thread_composer_background: Some(NewThreadComposerBackground {
                 path: "/tmp/zeron/new-thread-background.png".into(),
                 name: "background.png".into(),

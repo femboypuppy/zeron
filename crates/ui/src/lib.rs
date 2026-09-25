@@ -59,6 +59,7 @@ pub mod theme;
 pub mod theme_library;
 pub mod transcript;
 pub mod typography;
+pub(crate) mod wallpaper_frost;
 mod workspace_links;
 
 use std::path::PathBuf;
@@ -175,11 +176,13 @@ pub fn run_app(config: UiConfig) {
             cx,
         );
         theme_library::init(data_dir.clone(), cx);
+        wallpaper_frost::init(&data_dir, cx);
         appearance::init(
             ui_settings.appearance,
             ui_settings.theme_selection,
             ui_settings.accent,
             ui_settings.surface,
+            ui_settings.frost_strength,
             cx,
         );
         history::init(
@@ -330,6 +333,9 @@ fn save_main_window_geometry(window: &gpui::Window, cx: &mut App) {
 fn observe_main_window_geometry<T: 'static>(window: &mut gpui::Window, cx: &gpui::Context<T>) {
     cx.observe_window_bounds(window, |_, window, cx| {
         save_main_window_geometry(window, cx);
+        // The wallpaper frost lines up with the desktop behind the window,
+        // so it re-anchors as the window moves.
+        cx.notify();
     })
     .detach();
 }
