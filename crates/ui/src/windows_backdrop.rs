@@ -22,6 +22,11 @@ use gpui::Window;
 #[cfg(target_os = "windows")]
 pub fn apply(window: &Window, live: bool, dark: bool) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    // Nothing to apply or undo: skip the platform handle entirely (gpui's
+    // test windows have none, and asking for it panics).
+    if !live && !imp::applied() {
+        return;
+    }
     // Fully qualified: gpui's inherent `Window::window_handle` returns its own
     // handle type, not the platform one.
     let Ok(handle) = HasWindowHandle::window_handle(window) else {
@@ -73,6 +78,10 @@ mod imp {
 
     const WCA_ACCENT_POLICY: u32 = 0x13;
     const ACCENT_DISABLED: u32 = 0;
+
+    pub(super) fn applied() -> bool {
+        APPLIED.load(Ordering::Relaxed)
+    }
 
     pub(super) unsafe fn apply(hwnd: HWND, live: bool, dark: bool) {
         if live {
