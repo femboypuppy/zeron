@@ -1,0 +1,59 @@
+name: Windows build
+
+# Builds the portable Windows app on GitHub's runners and attaches it to the
+# run as a downloadable artifact (Actions → Windows build → the run →
+# Artifacts → zeron-windows-x64), so no local toolchain, disk space, or
+# memory is needed. Runs on every push to main that touches the app, or
+# manually via "Run workflow".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'apps/zeron/**'
+      - 'crates/**'
+      - 'dist/windows/**'
+      - 'scripts/package-windows.ps1'
+      - '.github/workflows/windows-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Locate Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Package portable app
+        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeron-windows-x64
+          path: |
+            target/package/*.zip
+            target/package/*.exe
+          if-no-files-found: error
+          retention-days: 14
