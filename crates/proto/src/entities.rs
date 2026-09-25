@@ -529,6 +529,17 @@ pub struct AgentSessionPreview {
     pub omitted: usize,
 }
 
+/// `ForkChat` reply: the new chat rewound to just before a user message, and
+/// that message's text (offered back in the composer for editing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkedChat {
+    pub chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    pub prompt: String,
+}
+
 /// `ImportAgentSession` reply: the chat holding the imported conversation.
 /// `existing` is true when an earlier import already created it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

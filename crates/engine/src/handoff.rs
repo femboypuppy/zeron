@@ -68,15 +68,19 @@ pub(crate) fn handoff_prompt(
     }
     let omitted = keep;
     let messages = messages.split_off(keep);
-    let source = from.map_or_else(
-        || "another agent".to_string(),
-        |from| agent_label(from).to_string(),
-    );
+    let intro = match from.filter(|from| *from != to) {
+        Some(from) => format!(
+            "Until now this conversation was with {}; you ({}) are taking it over.",
+            agent_label(from),
+            agent_label(to)
+        ),
+        None => "This conversation continues in a new session, so its earlier messages \
+                 aren't in your context."
+            .to_string(),
+    };
     let mut out = format!(
-        "<previous-conversation>\nUntil now this conversation was with {source}; you ({}) are \
-         taking it over. Below is the conversation so far, oldest first, for context. Continue \
-         from it; the user's new message follows after this block.\n",
-        agent_label(to)
+        "<previous-conversation>\n{intro} Below is the conversation so far, oldest first, for \
+         context. Continue from it; the user's new message follows after this block.\n"
     );
     if omitted > 0 {
         out.push_str(&format!("\n[{omitted} earlier messages omitted]\n"));
@@ -266,6 +270,6 @@ mod tests {
             "the oldest are dropped first"
         );
         assert!(prompt.contains("earlier messages omitted]"));
-        assert!(prompt.contains("was with another agent"));
+        assert!(prompt.contains("continues in a new session"));
     }
 }

@@ -33,6 +33,7 @@ pub mod profile;
 pub mod project_actions;
 pub mod registry;
 pub mod repos;
+pub mod rewind;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;

@@ -5387,6 +5387,14 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
+    /// Put `text` in `chat_id`'s draft; the composer shows it when that chat
+    /// opens (rewind offers the rewound message back for editing).
+    pub(crate) fn seed_draft(&mut self, chat_id: String, text: String) {
+        if !text.is_empty() {
+            self.drafts.insert(chat_id, text);
+        }
+    }
+
     pub(crate) fn set_dock_frame(
         &mut self,
         frame: crate::composer_dock::DockFrame,

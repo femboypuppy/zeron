@@ -304,6 +304,13 @@ struct ListAgentSessionsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ForkChatParams {
+    chat_id: String,
+    message_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AgentSessionParams {
     harness: zeron_proto::HarnessId,
     session_id: String,
@@ -1299,6 +1306,8 @@ fn forwardable(method: &str) -> bool {
             // The conversation (and the chat that resumes it) lives on the
             // device whose agent recorded it.
             | methods::IMPORT_AGENT_SESSION
+            // A fork is created on the chat's host, where its doc lives.
+            | methods::FORK_CHAT
             | methods::SEARCH_FILES
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
@@ -2609,6 +2618,17 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&preview)
+            }
+            methods::FORK_CHAT => {
+                let p: ForkChatParams = parse_params(params)?;
+                let (doc_host, workspace) = (self.doc_host.clone(), self.workspace.clone());
+                let forked = tokio::task::spawn_blocking(move || {
+                    crate::rewind::fork_chat(&doc_host, &workspace, &p.chat_id, &p.message_id)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&forked)
             }
             methods::IMPORT_AGENT_SESSION => {
                 let p: AgentSessionParams = parse_params(params)?;

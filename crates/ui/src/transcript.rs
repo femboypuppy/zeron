@@ -3254,6 +3254,9 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// A user message's "Rewind": fork the chat into a new one just before
+    /// `message_id`, offering the message back for editing.
+    Rewind { chat_id: String, message_id: String },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -6529,6 +6532,13 @@ impl Transcript {
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
         let copy_entry_id = row.entry_id.clone();
+        // Rewind lives on the user's own messages in a chat's main
+        // transcript (not subagent tabs, which are read-only views).
+        let rewind_target = self
+            .chat_id
+            .clone()
+            .filter(|_| is_user_row && self.doc_override.is_none())
+            .map(|chat_id| (chat_id, row.entry_id.to_string()));
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
                 .text_size(crate::typography::ui_rems(12.0))
@@ -6571,7 +6581,38 @@ impl Transcript {
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM));
-            let metadata = metadata.child(timestamp).children(copy);
+            let rewind = rewind_target.clone().map(|(chat_id, message_id)| {
+                let fade_key = format!("rewind-message-hover-{message_id}");
+                div()
+                    .id(SharedString::from(format!("rewind-message-{message_id}")))
+                    .size(px(Theme::SPACE_MD * 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        &fade_key,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.08),
+                    ))
+                    .on_hover(motion::hover_listener(fade_key))
+                    .tooltip(crate::settings::widgets::text_tooltip(
+                        "Rewind to here: continue in a new chat from before this message",
+                    ))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(TranscriptEvent::Rewind {
+                            chat_id: chat_id.clone(),
+                            message_id: message_id.clone(),
+                        });
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::RESTART)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+            });
+            let metadata = metadata.child(timestamp).children(rewind).children(copy);
             div()
                 .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
                 .pt(px(Theme::SPACE_SM))

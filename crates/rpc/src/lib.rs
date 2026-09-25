@@ -160,6 +160,8 @@ pub mod methods {
     pub const PREVIEW_AGENT_SESSION: &str = "PreviewAgentSession";
     /// Copy one agent conversation into a new chat that resumes it.
     pub const IMPORT_AGENT_SESSION: &str = "ImportAgentSession";
+    /// Rewind: fork a chat into a new one just before one of its user messages.
+    pub const FORK_CHAT: &str = "ForkChat";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     // Device-local workspace filesystem operations. All are relay-forwardable;

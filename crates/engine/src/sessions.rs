@@ -78,6 +78,10 @@ struct ResumeLookup {
     /// switched agents, so the run starts fresh with the transcript handed
     /// over (see [`crate::handoff`]).
     switched_from: Option<HarnessId>,
+    /// The run starts a fresh session on a chat that already has history — a
+    /// switched agent, or the "do not resume" tombstone (a rewound fork) — so
+    /// the transcript is handed to it.
+    handoff: bool,
 }
 
 /// Configuration baked into a live harness runtime. The steering mailbox only
@@ -480,25 +484,25 @@ impl SessionsEngine {
             let lookup = self.inner.resume_for(chat_id, &request.cwd, harness_id);
             request.resume = lookup.resume;
             resume_injected = request.resume.is_some();
-            // The chat switched agents: this agent starts fresh, so hand it
-            // the conversation so far. A startup retry re-sends the request
-            // it was given (already carrying the handoff).
-            if let Some(previous) = lookup.switched_from
+            // A fresh session on a chat with history (switched agent, rewound
+            // fork): hand it the conversation so far. A startup retry
+            // re-sends the request it was given (already carrying it).
+            if lookup.handoff
                 && !startup_retry
                 && let Ok(entries) = handle.doc().read_entries()
                 && let Some(prompt) = crate::handoff::handoff_prompt(
                     &entries,
                     &user_id,
-                    Some(previous),
+                    lookup.switched_from,
                     harness_id,
                     &request.prompt,
                 )
             {
                 tracing::info!(
                     chat = %chat_id,
-                    from = ?previous,
+                    from = ?lookup.switched_from,
                     to = ?harness_id,
-                    "agent switch: handing the conversation to a fresh session"
+                    "handing the conversation to a fresh session"
                 );
                 request.prompt = prompt;
             }
@@ -1145,17 +1149,20 @@ impl Inner {
                 return ResumeLookup {
                     resume: None,
                     switched_from: None,
+                    handoff: true,
                 };
             }
             if let Some(owner) = owner.filter(|owner| *owner != harness) {
                 return ResumeLookup {
                     resume: None,
                     switched_from: Some(owner),
+                    handoff: true,
                 };
             }
             ResumeLookup {
                 resume: cwd_ok(session_cwd).then_some(session_id),
                 switched_from: None,
+                handoff: false,
             }
         };
         if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
@@ -1170,6 +1177,7 @@ impl Inner {
             return ResumeLookup {
                 resume: None,
                 switched_from: None,
+                handoff: false,
             };
         };
         // Cache the journal hit (memory + row) so later dispatches skip the scan.

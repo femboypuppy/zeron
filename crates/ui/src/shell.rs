@@ -3302,7 +3302,63 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::Rewind {
+                chat_id,
+                message_id,
+            } => self.rewind_chat(chat_id.clone(), message_id.clone(), cx),
         }
+    }
+
+    /// Rewind: fork `chat_id` into a new chat just before `message_id` (on the
+    /// chat's host device), open it, and offer that message back in the
+    /// composer for editing. The original chat is left as it was.
+    fn rewind_chat(&mut self, chat_id: String, message_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let mut params = serde_json::json!({ "chatId": chat_id, "messageId": message_id });
+        {
+            let state = self.state.read(cx);
+            let host = state
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .map(|chat| chat.device_id.clone());
+            if let Some(host) =
+                host.filter(|host| state.local_device_id.as_deref() != Some(host.as_str()))
+            {
+                params["targetDeviceId"] = serde_json::Value::String(host);
+            }
+        }
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::FORK_CHAT, params)
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<zeron_proto::ForkedChat>(value)
+                        .map_err(|err| err.to_string())
+                });
+            this.update(cx, |shell, cx| match result {
+                Ok(forked) => {
+                    shell.composer.update(cx, |composer, _| {
+                        composer.seed_draft(forked.chat_id.clone(), forked.prompt.clone())
+                    });
+                    if let Some(space_id) = forked.space_id {
+                        if shell.settings.space_filter.is_some() {
+                            shell.settings.space_filter = Some(space_id.clone());
+                        }
+                        shell.settings.last_space_id = Some(space_id);
+                        shell.schedule_save(cx);
+                    }
+                    shell.open_chat(forked.chat_id, cx);
+                }
+                Err(err) => tracing::warn!(error = %err, "rewind failed"),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// A spawn chip's "Open subagent": focus the existing tab for that doc,

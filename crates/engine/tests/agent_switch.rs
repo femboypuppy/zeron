@@ -99,21 +99,35 @@ fn request(prompt: &str, harness: HarnessId) -> RunRequest {
 }
 
 fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
+    entries_of(core, CHAT)
+}
+
+fn entries_of(core: &EngineCore, chat: &str) -> Vec<SessionMessageEntry> {
     core.doc_host
-        .open(CHAT)
+        .open(chat)
         .ok()
         .and_then(|h| h.doc().read_entries().ok())
         .unwrap_or_default()
 }
 
 async fn turn(core: &EngineCore, prompt: &str, harness: HarnessId, message_id: &str) {
-    let done_before = entries(core)
+    turn_in(core, CHAT, prompt, harness, message_id).await
+}
+
+async fn turn_in(
+    core: &EngineCore,
+    chat: &str,
+    prompt: &str,
+    harness: HarnessId,
+    message_id: &str,
+) {
+    let done_before = entries_of(core, chat)
         .iter()
         .filter(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
         .count();
     core.doc_host
         .queue_command(
-            CHAT,
+            chat,
             SessionCommandPayload::Run {
                 request: request(prompt, harness),
                 message_id: message_id.into(),
@@ -122,7 +136,7 @@ async fn turn(core: &EngineCore, prompt: &str, harness: HarnessId, message_id: &
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let done = entries(core)
+        let done = entries_of(core, chat)
             .iter()
             .filter(|e| {
                 e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
@@ -240,6 +254,99 @@ async fn switching_agents_hands_the_conversation_to_a_fresh_session() {
         assert_eq!(fourth.resume, None);
         assert!(fourth.prompt.contains("was with Codex"));
         assert!(fourth.prompt.ends_with("back to you"));
+    }
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn rewinding_forks_before_a_message_and_hands_over_the_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(RecordingAgent {
+        id: HarnessId::Mock,
+        session_id: "mock-session",
+        requests: requests.clone(),
+    }));
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None).unwrap();
+    core.workspace
+        .create_space("space", &core.device_id, "/tmp", None, false)
+        .unwrap();
+    core.workspace
+        .create_chat(CHAT, Some("space"), None, None, None)
+        .unwrap();
+    core.workspace.rename_chat(CHAT, "Original").unwrap();
+    turn(
+        &core,
+        "remember the codeword PINEAPPLE",
+        HarnessId::Mock,
+        "m1",
+    )
+    .await;
+    turn(&core, "write the whole app", HarnessId::Mock, "m2").await;
+
+    let forked =
+        zeron_engine::rewind::fork_chat(&core.doc_host, &core.workspace, CHAT, "m2").unwrap();
+    assert_eq!(
+        forked.prompt, "write the whole app",
+        "offered back for editing"
+    );
+    assert_eq!(forked.space_id.as_deref(), Some("space"));
+    let fork_entries = entries_of(&core, &forked.chat_id);
+    let roles: Vec<_> = fork_entries.iter().map(|e| e.role).collect();
+    assert_eq!(
+        roles,
+        [MessageRole::User, MessageRole::Assistant],
+        "everything before the chosen message, nothing after"
+    );
+    assert_eq!(entries(&core).len(), 4, "the original chat is untouched");
+    let row = core.workspace.chat(&forked.chat_id).unwrap().unwrap();
+    assert_eq!(row.title.as_deref(), Some("Original (rewound)"));
+    assert_eq!(row.space_id.as_deref(), Some("space"));
+    assert_eq!(
+        row.harness_session_id.as_deref(),
+        Some(""),
+        "never resumes the source"
+    );
+    assert!(
+        zeron_engine::rewind::fork_chat(&core.doc_host, &core.workspace, CHAT, "missing").is_err()
+    );
+
+    // The fork's first run: fresh session, forked history handed over.
+    turn_in(
+        &core,
+        &forked.chat_id,
+        "write just the login page",
+        HarnessId::Mock,
+        "f1",
+    )
+    .await;
+    {
+        let log = requests.lock().unwrap();
+        let (_, first) = &log[2];
+        assert_eq!(first.resume, None);
+        assert!(first.prompt.contains("continues in a new session"));
+        assert!(first.prompt.contains("remember the codeword PINEAPPLE"));
+        assert!(
+            !first.prompt.contains("write the whole app"),
+            "the rewound-away message isn't part of the history"
+        );
+        assert!(first.prompt.ends_with("write just the login page"));
+    }
+    // Then the fork's own session resumes like any chat.
+    turn_in(
+        &core,
+        &forked.chat_id,
+        "and the signup page",
+        HarnessId::Mock,
+        "f2",
+    )
+    .await;
+    {
+        let log = requests.lock().unwrap();
+        let (_, second) = &log[3];
+        assert_eq!(second.resume.as_deref(), Some("mock-session"));
+        assert_eq!(second.prompt, "and the signup page");
     }
     core.shutdown().await;
 }
