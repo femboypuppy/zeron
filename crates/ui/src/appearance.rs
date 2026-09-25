@@ -387,9 +387,21 @@ fn apply_window_background(cx: &mut App) {
     else {
         return;
     };
+    // Windows: "Live blur" swaps gpui's legacy accent blur for DWM's system
+    // Acrylic backdrop (see `windows_backdrop`).
+    let (live, dark) = cx.try_global::<Theme>().map_or((false, true), |theme| {
+        (
+            cfg!(target_os = "windows")
+                && theme.is_glass()
+                && crate::settings::current(cx).frost_backdrop
+                    == crate::settings::FrostBackdrop::System,
+            matches!(theme.appearance, crate::theme::Appearance::Dark),
+        )
+    });
     for window in cx.windows() {
         if let Err(error) = window.update(cx, |_, window, _| {
             window.set_background_appearance(wanted);
+            crate::windows_backdrop::apply(window, live, dark);
         }) {
             tracing::warn!(%error, "appearance: window background not applied");
         }

@@ -60,6 +60,7 @@ pub mod theme_library;
 pub mod transcript;
 pub mod typography;
 pub(crate) mod wallpaper_frost;
+pub(crate) mod windows_backdrop;
 mod workspace_links;
 
 use std::path::PathBuf;
@@ -406,6 +407,9 @@ fn open_main_window(
                 // the subscription lives as long as the window does, and the window
                 // owns nothing that would drop it early.
                 appearance::observe_window(window, cx).detach();
+                // Install the window backdrop once the window exists (Windows
+                // live blur is applied on top of gpui's own background).
+                appearance::reapply_window_background(cx);
                 let shell = cx.new(|cx| {
                     observe_main_window_geometry(window, cx);
                     shell::Shell::new(state, boot, cx)

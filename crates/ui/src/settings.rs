@@ -695,8 +695,9 @@ impl Default for FrostStrength {
 }
 
 /// Where the window's frost comes from on Windows: Zeron's blurred copy of
-/// the desktop wallpaper ([`crate::wallpaper_frost`]), or DWM's own backdrop
-/// blur — which some systems silently replace with a flat tint.
+/// the desktop wallpaper ([`crate::wallpaper_frost`]), or DWM's live Acrylic
+/// blur of the apps behind the window ([`crate::windows_backdrop`]) — which
+/// some systems (or backdrop-rewriting tools) replace with a flat tint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FrostBackdrop {
@@ -711,7 +712,7 @@ impl FrostBackdrop {
     pub fn label(self) -> &'static str {
         match self {
             Self::Wallpaper => "Wallpaper",
-            Self::System => "Windows blur",
+            Self::System => "Live blur",
         }
     }
 }

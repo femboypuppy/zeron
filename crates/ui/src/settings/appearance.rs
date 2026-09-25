@@ -2694,6 +2694,8 @@ impl Render for AppearancePage {
                 crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
                     settings.frost_backdrop = backdrop;
                 });
+                // Re-install the native backdrop (live blur on or off).
+                appearance::apply(cx);
                 cx.refresh_windows();
                 cx.notify();
             })
@@ -2781,7 +2783,7 @@ impl Render for AppearancePage {
                     "A blurred copy of your desktop wallpaper, painted by Zeron."
                 }
                 crate::settings::FrostBackdrop::System => {
-                    "Windows' live blur. Some systems show a flat colour instead."
+                    "Windows Acrylic: blurs the apps behind the window. Needs Transparency                      effects, and backdrop mods (e.g. Windhawk Translucent Windows) set to                      Default for zeron.exe."
                 }
             };
             settings_rows.push(
