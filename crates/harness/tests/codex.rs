@@ -1359,7 +1359,13 @@ async fn native_commands_use_rpc_operations_and_render_results() {
             }
         }
         assert_eq!(completions, 1, "{prompt}");
-        assert_eq!(text, expected, "{prompt}");
+        assert_eq!(
+            text,
+            format!("{expected}
+
+"),
+            "{prompt}: a paragraph of its own"
+        );
     }
 }
 

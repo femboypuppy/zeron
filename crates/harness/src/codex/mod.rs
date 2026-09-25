@@ -1248,8 +1248,13 @@ async fn run_session(session: Session) {
                                 "contextCompaction" => Some("Context compacted."),
                                 _ => None,
                             };
+                            // A paragraph of its own: the turn's reply
+                            // streams right after it ("Context
+                            // compacted.Hi!…" read as one sentence).
                             if let Some(text) = output
-                                && !send(&event_tx, AgentEvent::TextDelta { text: text.into() }).await
+                                && !send(&event_tx, AgentEvent::TextDelta { text: format!("{text}
+
+") }).await
                             { break 'main; }
                         }
                         if matches!(item_type(item), "agentMessage" | "agent_message") {
