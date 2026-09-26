@@ -7021,12 +7021,19 @@ impl Shell {
                                     let id = id.clone();
                                     move || format!("chat-time-{id}")
                                 })
-                                .w(px(30.0))
                                 .flex_none()
                                 .text_right()
                                 .text_size(crate::typography::ui_rems(11.0))
                                 .text_color(subline)
-                                .child(compact_jump_label.unwrap_or(time_ago)),
+                                // A jump chip can outgrow the time column
+                                // ("Ctrl+1" off macOS): it widens the column
+                                // on one line instead of wrapping.
+                                .map(|el| match compact_jump_label {
+                                    Some(label) => {
+                                        el.min_w(px(30.0)).whitespace_nowrap().child(label)
+                                    }
+                                    None => el.w(px(30.0)).child(time_ago),
+                                }),
                         )
                     }),
             )
