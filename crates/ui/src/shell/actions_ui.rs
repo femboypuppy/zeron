@@ -414,14 +414,21 @@ impl Shell {
         cx.notify();
     }
 
-    fn run_project_action(&mut self, action: ProjectAction, cx: &mut Context<Self>) {
+    fn run_project_action(
+        &mut self,
+        key: &ProjectActionsKey,
+        action: ProjectAction,
+        cx: &mut Context<Self>,
+    ) {
         let Some(context) = self.project_action_context(cx) else {
             return;
         };
-        if !self
-            .project_actions
-            .active_status()
-            .is_some_and(ProjectActionsStatus::can_run)
+        if context.key != *key
+            || self.project_actions.active.as_ref() != Some(key)
+            || !self
+                .project_actions
+                .active_status()
+                .is_some_and(ProjectActionsStatus::can_run)
         {
             return;
         }
@@ -520,15 +527,12 @@ impl Shell {
     ) -> Option<AnyElement> {
         self.ensure_project_actions(cx);
         let status = self.project_actions.active_status()?.clone();
-        if matches!(
-            status,
-            ProjectActionsStatus::Idle
-                | ProjectActionsStatus::Loading
-                | ProjectActionsStatus::Unsupported
-        ) {
-            return None;
-        }
         let snapshot = self.project_actions.visible_snapshot()?;
+        let key = self.project_actions.active.clone()?;
+        let loading = matches!(
+            status,
+            ProjectActionsStatus::Idle | ProjectActionsStatus::Loading
+        );
         let can_run = status.can_run();
         let unavailable = matches!(status, ProjectActionsStatus::Unavailable { .. });
         let theme = Theme::of(cx).clone();
@@ -572,20 +576,47 @@ impl Shell {
                 )),
             );
 
-        if let Some(action) = preferred.clone() {
+        if loading {
+            control = control
+                .child(
+                    action_segment(&theme, "project-action-loading", false)
+                        .rounded_l(px(ACTION_CONTROL_RADIUS))
+                        .opacity(0.45)
+                        .child(
+                            div()
+                                .size(px(13.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(crate::loaders::mini_mono_spinner(
+                                    "project-actions-loading",
+                                    2.0,
+                                    theme.text_muted,
+                                    cx.entity_id(),
+                                    cx,
+                                )),
+                        )
+                        .when(show_label, |el| el.child("Loading…")),
+                )
+                .child(action_divider(&theme))
+                .child(action_chevron(&theme, false, |_, _, _| {}));
+        } else if let Some(action) = preferred.clone() {
             let run_action = action.clone();
-            let main = action_segment(&theme, "project-action-main")
+            let run_key = key.clone();
+            let main = action_segment(&theme, "project-action-main", can_run)
                 .rounded_l(px(ACTION_CONTROL_RADIUS))
                 .when(!can_run, |el| el.opacity(0.45))
                 .when(can_run, |el| {
                     el.cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.run_project_action(run_action.clone(), cx)
+                            this.run_project_action(&run_key, run_action.clone(), cx)
                         }))
                 })
                 .child(
                     icon(action_icon(action.icon))
                         .size(px(13.0))
+                        .flex_none()
                         .text_color(theme.text_muted),
                 )
                 .when(show_label, |el| {
@@ -599,6 +630,7 @@ impl Shell {
             control = control.child(main).child(action_divider(&theme)).child(
                 action_chevron(
                     &theme,
+                    true,
                     cx.listener(|this, _, _, cx| this.toggle_project_actions_menu(cx)),
                 )
                 .on_mouse_down(
@@ -609,7 +641,7 @@ impl Shell {
                 ),
             );
         } else if unavailable {
-            let retry = action_segment(&theme, "project-actions-unavailable")
+            let retry = action_segment(&theme, "project-actions-unavailable", true)
                 .rounded(px(ACTION_CONTROL_RADIUS))
                 .cursor_pointer()
                 .on_mouse_down(
@@ -629,7 +661,7 @@ impl Shell {
                 });
             control = control.child(retry);
         } else {
-            let add = action_segment(&theme, "project-action-add")
+            let add = action_segment(&theme, "project-action-add", true)
                 .rounded_l(px(ACTION_CONTROL_RADIUS))
                 .when(!has_imports, |el| el.rounded_r(px(ACTION_CONTROL_RADIUS)))
                 .cursor_pointer()
@@ -641,12 +673,13 @@ impl Shell {
                         .size(px(13.0))
                         .text_color(theme.text_muted),
                 )
-                .child(SharedString::from("Add action"));
+                .child("Add action");
             control = control.child(add);
             if has_imports {
                 control = control.child(action_divider(&theme)).child(
                     action_chevron(
                         &theme,
+                        true,
                         cx.listener(|this, _, _, cx| this.toggle_project_actions_menu(cx)),
                     )
                     .on_mouse_down(
@@ -659,8 +692,9 @@ impl Shell {
             }
         }
 
-        if menu_mounted && (has_actions || has_imports || !can_run) {
-            let menu = self.render_project_actions_menu(&status, &snapshot, viewport_height, cx);
+        if !loading && menu_mounted && (has_actions || has_imports || !can_run) {
+            let menu =
+                self.render_project_actions_menu(&key, &status, &snapshot, viewport_height, cx);
             control = control.child(popover::anchored_menu_below(
                 "project-actions-menu",
                 menu,
@@ -672,6 +706,7 @@ impl Shell {
 
     fn render_project_actions_menu(
         &mut self,
+        key: &ProjectActionsKey,
         status: &ProjectActionsStatus,
         snapshot: &ProjectActionsSnapshot,
         viewport_height: Pixels,
@@ -709,6 +744,7 @@ impl Shell {
                 });
         }
         for action in snapshot.actions.clone() {
+            let key = key.clone();
             let run = action.clone();
             let edit = action.clone();
             let row_id = SharedString::from(format!("project-action-row-{}", action.id));
@@ -717,7 +753,7 @@ impl Shell {
                     .id(row_id)
                     .when(status.can_run(), |row| {
                         row.on_click(cx.listener(move |this, _, _, cx| {
-                            this.run_project_action(run.clone(), cx)
+                            this.run_project_action(&key, run.clone(), cx)
                         }))
                     })
                     .child(
@@ -1048,7 +1084,7 @@ fn action_fill(theme: &Theme, hover: bool) -> gpui::Hsla {
     }
 }
 
-fn action_segment(theme: &Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
+fn action_segment(theme: &Theme, id: &'static str, enabled: bool) -> gpui::Stateful<gpui::Div> {
     // Hover tints on top of the fill, so both halves stay one piece.
     let hover = action_fill(theme, true);
     div()
@@ -1062,7 +1098,7 @@ fn action_segment(theme: &Theme, id: &'static str) -> gpui::Stateful<gpui::Div> 
         .text_size(px(11.5))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.text)
-        .hover(move |style| style.bg(hover))
+        .when(enabled, |el| el.hover(move |style| style.bg(hover)))
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
 }
 
@@ -1079,6 +1115,7 @@ fn action_divider(theme: &Theme) -> gpui::Div {
 
 fn action_chevron(
     theme: &Theme,
+    enabled: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     let hover = action_fill(theme, true);
@@ -1086,17 +1123,21 @@ fn action_chevron(
         .id("project-actions-chevron")
         .h_full()
         .relative()
+        .flex_none()
         .w(px(22.0))
         .rounded_r(px(ACTION_CONTROL_RADIUS))
         .flex()
         .items_center()
         .justify_center()
-        .cursor_pointer()
-        .hover(move |style| style.bg(hover))
+        .when(!enabled, |el| el.opacity(0.45))
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-        .on_click(move |event, window, cx| {
-            cx.stop_propagation();
-            on_click(event, window, cx)
+        .when(enabled, |el| {
+            el.cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .on_click(move |event, window, cx| {
+                    cx.stop_propagation();
+                    on_click(event, window, cx)
+                })
         })
         .child(
             icon(icons::ALT_ARROW_DOWN)
