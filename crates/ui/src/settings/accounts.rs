@@ -2388,7 +2388,11 @@ mod tests {
             "Open agy to sign in"
         );
         assert_eq!(
-            add_option_label(HarnessId::Antigravity, login_options(HarnessId::Antigravity)[0], true),
+            add_option_label(
+                HarnessId::Antigravity,
+                login_options(HarnessId::Antigravity)[0],
+                true
+            ),
             "Open agy to sign in"
         );
         // Every agent with a login of its own has an Accounts section.
