@@ -189,7 +189,9 @@ pub fn installed(id: HarnessId) -> bool {
         Grok => crate::AcpHarness::grok().installed(),
         Hermes => crate::AcpHarness::hermes().installed(),
         Devin => crate::AcpHarness::devin().installed(),
-        Antigravity => crate::AcpHarness::antigravity().installed(),
+        Antigravity => {
+            crate::AgyCliHarness::new().installed() || crate::AcpHarness::antigravity().installed()
+        }
         Mock => false,
     }
 }

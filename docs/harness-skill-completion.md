@@ -37,7 +37,8 @@ Typing an unselected inline `/word` does not execute a local action.
 | Claude Code | Project-scoped commands from its initialize catalog |
 | OpenCode | Project-scoped server command catalog |
 | Pi | Native `get_commands`, including extension commands and `skill:*` invocations |
-| Devin, Grok, Hermes, Antigravity | Advertised ACP commands, including session command updates |
+| Devin, Grok, Hermes, Antigravity ACP fallback | Advertised ACP commands, including session command updates |
+| Antigravity CLI (`agy`) | Project skills; native headless streaming does not advertise a command catalog |
 | Cursor | Workspace actions; its SDK adapter has no native command catalog |
 
 This does not imply that every command in a provider's terminal UI can execute

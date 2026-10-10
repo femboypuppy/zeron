@@ -71,7 +71,8 @@ dialect and leaves the user's configured servers alone:
 | Harness | Where |
 | ------- | ----- |
 | Claude  | `--mcp-config <inline json>` (no `--strict-mcp-config`)             |
-| ACP (Devin, Grok, Hermes, Antigravity) | `session/new` and `session/load` → `mcpServers: [{name, command, args, env}]` |
+| ACP (Devin, Grok, Hermes, Antigravity fallback) | `session/new` and `session/load` → `mcpServers: [{name, command, args, env}]` |
+| Antigravity CLI (`agy`) | Uses the CLI's configured MCP servers; headless mode has no per-run MCP injection |
 | Pi | Per-run `--extension` bridges stdio MCP into Pi tools in the native RPC process |
 | OpenCode | Child-only `OPENCODE_CONFIG_CONTENT`: `mcp.zeren` on 1.x, `mcp.servers.zeren` on 2.x |
 | Codex   | `thread/start` config overrides `mcp_servers.zeren.{command,args,env}` |

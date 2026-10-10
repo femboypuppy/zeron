@@ -75,7 +75,7 @@ fn install_hint(harness: HarnessId, enabled: bool, can_install: bool) -> String 
         return if can_install {
             "Install Antigravity to enable"
         } else {
-            "Set ANTIGRAVITY_ACP_EXECUTABLE to enable Antigravity"
+            "Install the agy CLI or set AGY_EXECUTABLE to enable Antigravity"
         }
         .into();
     }
@@ -1376,9 +1376,7 @@ fn install_visibility_and_hint_follow_target_capabilities() {
         install_hint(HarnessId::Antigravity, false, true),
         "Install Antigravity to enable"
     );
-    assert!(
-        install_hint(HarnessId::Antigravity, false, false).contains("ANTIGRAVITY_ACP_EXECUTABLE")
-    );
+    assert!(install_hint(HarnessId::Antigravity, false, false).contains("AGY_EXECUTABLE"));
 }
 
 #[cfg(test)]

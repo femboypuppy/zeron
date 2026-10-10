@@ -5,9 +5,10 @@
 //! ([`CodexHarness`]), Cursor through a pinned @cursor/sdk shim
 //! ([`CursorHarness`]), and opencode over its own HTTP/SSE server protocol
 //! ([`OpencodeHarness`] — what the opencode desktop app speaks). The shared
-//! [`AcpHarness`] remains ONLY for agents built ground-up on ACP — Devin
-//! (`devin acp`), Grok (`grok agent stdio`) Hermes (`hermes acp`) and
-//! Antigravity. Pi uses native JSONL RPC ([`PiHarness`]).
+//! [`AcpHarness`] remains for ACP agents — Devin (`devin acp`), Grok
+//! (`grok agent stdio`), Hermes (`hermes acp`) and legacy Antigravity.
+//! An installed `agy` CLI uses its native stream-JSON wire instead.
+//! Pi uses native JSONL RPC ([`PiHarness`]).
 //! Adapter-mediated ACP for claude/codex/cursor was retired — and opencode's
 //! ACP layer with it: the adapters held prompt turns open for background
 //! work the CLIs themselves settle eagerly (and opencode's settles on the
@@ -179,6 +180,7 @@ pub trait Harness: Send + Sync {
 
 pub mod acp;
 pub(crate) mod adapter_install;
+pub mod agy;
 pub mod archive_install;
 mod catalog;
 mod catalog_failure;
@@ -397,6 +399,7 @@ pub(crate) fn crash_message(
 }
 
 pub use acp::AcpHarness;
+pub use agy::AgyCliHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use cursor::CursorHarness;

@@ -738,23 +738,29 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeren_harness::OpencodeHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeren_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
     );
-    // antigravity over acp (google's agy_acp_server), same lazy pattern: the
-    // static descriptor mirrors AcpHarness::antigravity() exactly. No steering
-    // extension (turn boundaries), and effort is baked into the model ids, so
-    // the ladder lives on each model rather than the harness.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Antigravity,
             name: "Antigravity".into(),
-            supports_steering: true,
+            supports_steering: false,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
             can_install: false,
             enabled: None,
         },
-        Box::new(|| zeren_harness::AcpHarness::antigravity().installed()),
-        Box::new(|| Ok(Arc::new(zeren_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
+        Box::new(|| {
+            zeren_harness::AgyCliHarness::new().installed()
+                || zeren_harness::AcpHarness::antigravity().installed()
+        }),
+        Box::new(|| {
+            let cli = zeren_harness::AgyCliHarness::new();
+            if cli.installed() {
+                Ok(Arc::new(cli) as Arc<dyn Harness>)
+            } else {
+                Ok(Arc::new(zeren_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)
+            }
+        }),
     );
     registry
 }
@@ -1089,34 +1095,51 @@ mod tests {
         let Ok(expected) = std::env::var("ZEREN_TEST_AGY_INSTALLED") else {
             return;
         };
-        let registry = HarnessRegistry::new();
+        let registry = default_registry();
         let data = tempfile::tempdir().unwrap();
         registry.load_prefs(data.path());
-        registry.register(Arc::new(zeren_harness::AcpHarness::antigravity()));
         let expected = expected == "true";
-        assert_eq!(registry.descriptors()[0].installed, expected);
+        let descriptor = registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == HarnessId::Antigravity)
+            .unwrap();
+        assert_eq!(descriptor.installed, expected);
         assert_eq!(
             registry.enabled_set().contains(&HarnessId::Antigravity),
             expected
         );
-        assert_eq!(descriptor_enabled(&registry.descriptors()[0]), expected);
+        assert_eq!(descriptor_enabled(&descriptor), expected);
+        if expected && std::env::var("ZEREN_TEST_AGY_CLI").is_ok_and(|value| value == "true") {
+            let harness = registry.resolve(HarnessId::Antigravity).unwrap();
+            assert_eq!(
+                harness.executable_path(),
+                std::env::var_os("AGY_EXECUTABLE").map(Into::into)
+            );
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn antigravity_server_path_controls_detection_and_enablement() {
+    fn antigravity_cli_or_server_controls_detection_and_enablement() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let cli = bin.join("agy");
-        std::fs::write(&cli, "#!/bin/sh\nexit 91\n").unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
         let server = bin.join("agy_acp_server.par");
-        for installed in [false, true] {
-            if installed {
+        for (cli_installed, server_installed) in [(false, false), (true, false), (false, true)] {
+            if cli_installed {
+                std::fs::write(&cli, "#!/bin/sh\nexit 91\n").unwrap();
+                std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            } else if cli.exists() {
+                std::fs::remove_file(&cli).unwrap();
+            }
+            if server_installed {
                 std::fs::write(&server, "#!/bin/sh\nexit 91\n").unwrap();
                 std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+            } else if server.exists() {
+                std::fs::remove_file(&server).unwrap();
             }
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -1126,9 +1149,14 @@ mod tests {
                 ])
                 .env("HOME", home.path())
                 .env("PATH", &bin)
-                .env_remove("ANTIGRAVITY_ACP_EXECUTABLE")
+                .env("AGY_EXECUTABLE", &cli)
+                .env("ANTIGRAVITY_ACP_EXECUTABLE", &server)
                 .env("ZEREN_NO_LOGIN_SHELL", "1")
-                .env("ZEREN_TEST_AGY_INSTALLED", installed.to_string())
+                .env(
+                    "ZEREN_TEST_AGY_INSTALLED",
+                    (cli_installed || server_installed).to_string(),
+                )
+                .env("ZEREN_TEST_AGY_CLI", cli_installed.to_string())
                 .output()
                 .unwrap();
             assert!(
