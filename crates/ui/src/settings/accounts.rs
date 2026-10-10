@@ -2370,7 +2370,6 @@ mod tests {
             HarnessId::ClaudeCode,
             HarnessId::Codex,
             HarnessId::Cursor,
-            HarnessId::Antigravity,
             HarnessId::Grok,
             HarnessId::Devin,
         ] {
@@ -2386,6 +2385,10 @@ mod tests {
         }
         assert_eq!(
             add_account_label(HarnessId::Antigravity, true),
+            "Open agy to sign in"
+        );
+        assert_eq!(
+            add_option_label(HarnessId::Antigravity, login_options(HarnessId::Antigravity)[0], true),
             "Open agy to sign in"
         );
         // Every agent with a login of its own has an Accounts section.
