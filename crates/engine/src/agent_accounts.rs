@@ -31,11 +31,11 @@
 //!   (`StoredSdkCredentials`) holding the named, expiring user API key its
 //!   browser login mints. Deliberately SEPARATE from `cursor-agent login`'s
 //!   whole-account session tokens, which zeren never reads.
-//! - **Antigravity** — its ACP server keeps one Google login per
-//!   `GEMINI_HOME`: a token blob in the macOS Keychain (service `gemini`) or
-//!   `antigravity-acp/acp_token.json`, plus the method in `settings.json`.
-//!   The blob carries no identity and is never read — the login is listed
-//!   from the method and the token's PRESENCE only, active and unswitchable.
+//! - **Antigravity** — the native `agy` CLI keeps one Google login in the OS
+//!   credential store (detected on Windows by credential presence only).
+//!   Older ACP sessions keep a separate login per `GEMINI_HOME`: a token blob
+//!   in the macOS Keychain or `antigravity-acp/acp_token.json`, plus a method
+//!   in `settings.json`. Neither credential blob is read by the account list.
 //!
 //! Claude-swap mechanics:
 //!
@@ -180,6 +180,9 @@ pub struct AgentAccountsConfig {
     /// Whether Antigravity's Keychain token counts (macOS production); tests
     /// look at the temp token files only.
     pub antigravity_keychain: bool,
+    /// Whether to check the native `agy` CLI's OS credential store. Disabled
+    /// for isolated test homes, which must never read a real device login.
+    pub antigravity_cli_keychain: bool,
     /// Grok's `GROK_HOME` (default `~/.grok`) — holds `auth.json`.
     pub grok_home: PathBuf,
     /// Devin's `credentials.toml` (`$XDG_DATA_HOME/devin/`, default
@@ -221,6 +224,7 @@ impl AgentAccountsConfig {
             antigravity_keychain: cfg!(target_os = "macos")
                 && std::env::var_os("AGY_ACP_FORCE_FILE_STORAGE")
                     .is_none_or(|v| !matches!(v.to_str(), Some("1" | "true"))),
+            antigravity_cli_keychain: cfg!(windows),
             grok_home: stores::default_grok_home(),
             devin_credentials_file: stores::default_devin_credentials_file(),
             opencode_auth_file: stores::default_opencode_auth_file(),
@@ -242,6 +246,7 @@ impl AgentAccountsConfig {
             claude_keychain_service: None,
             antigravity_home: Some(root.join("gemini")),
             antigravity_keychain: false,
+            antigravity_cli_keychain: false,
             grok_home: root.join("grok"),
             devin_credentials_file: root.join("devin").join("credentials.toml"),
             opencode_auth_file: root.join("opencode").join("auth.json"),
@@ -2325,6 +2330,11 @@ impl AgentAccounts {
     }
 
     async fn detect_antigravity(&self) -> Option<AntigravityLogin> {
+        if self.inner.config.antigravity_cli_keychain && antigravity_cli_keychain_item() {
+            return Some(AntigravityLogin {
+                method: "cli-oauth".into(),
+            });
+        }
         let home = self.inner.config.antigravity_home.as_deref()?;
         detect_antigravity_login(home, self.inner.config.antigravity_keychain).await
     }
@@ -3010,6 +3020,7 @@ impl AntigravityLogin {
     /// the kind of login instead of an address.
     fn account(&self) -> AgentAccount {
         let (label, plan, kind) = match self.method.as_str() {
+            "cli-oauth" => ("Antigravity CLI account", None, AgentAuthKind::Oauth),
             "oauth-personal" => ("Google account", None, AgentAuthKind::Oauth),
             "oauth-business" => (
                 "Google account",
@@ -3065,6 +3076,26 @@ async fn detect_antigravity_login(home: &Path, keychain: bool) -> Option<Antigra
         return None;
     }
     Some(AntigravityLogin { method })
+}
+
+#[cfg(windows)]
+fn antigravity_cli_keychain_item() -> bool {
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    };
+
+    let target: Vec<u16> = "gemini:antigravity".encode_utf16().chain(Some(0)).collect();
+    let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+    let found = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) != 0 };
+    if !credential.is_null() {
+        unsafe { CredFree(credential.cast()) };
+    }
+    found
+}
+
+#[cfg(not(windows))]
+fn antigravity_cli_keychain_item() -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -4821,6 +4852,17 @@ mod login_tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn native_antigravity_login_is_a_single_active_cli_row() {
+        let row = AntigravityLogin {
+            method: "cli-oauth".into(),
+        }
+        .account();
+        assert_eq!(row.display_name.as_deref(), Some("Antigravity CLI account"));
+        assert_eq!(row.auth_kind, Some(AgentAuthKind::Oauth));
+        assert!(row.active && !row.switchable);
     }
 
     /// A stand-in for Anthropic's token endpoint: accepts one code and

@@ -190,6 +190,23 @@ fn selected_catalog_model<'a>(models: &'a [Model], selected: Option<&str>) -> Op
     }
 }
 
+fn antigravity_saved_variant<'a>(
+    models: &'a [Model],
+    selected: &str,
+) -> Option<(&'a Model, ReasoningLevel)> {
+    let (base, level) = [
+        ("-low", ReasoningLevel::Low),
+        ("-medium", ReasoningLevel::Medium),
+        ("-high", ReasoningLevel::High),
+    ]
+    .into_iter()
+    .find_map(|(suffix, level)| selected.strip_suffix(suffix).map(|base| (base, level)))?;
+    models
+        .iter()
+        .find(|model| model.id == base && model.reasoning_levels.contains(&level))
+        .map(|model| (model, level))
+}
+
 /// A model's default reasoning: X-High when the ladder offers it (zeren
 /// `DEFAULT_REASONING = "xhigh"`), else High, else the ladder's first entry.
 /// `None` only for ladder-less models (e.g. Haiku's thinking toggle instead).
@@ -844,7 +861,8 @@ impl Pickers {
                 } else {
                     this.harnesses = Loadable::Idle;
                 }
-                this.models.retain(|_, slot| matches!(slot, Loadable::Ready(_)));
+                this.models
+                    .retain(|_, slot| matches!(slot, Loadable::Ready(_)));
                 this.stale_models = this.models.keys().copied().collect();
                 this.revalidating.clear();
                 this.model_refresh_errors.clear();
@@ -1128,17 +1146,28 @@ impl Pickers {
     /// The reasoning level picked, configured or remembered — before any
     /// clamping to the selected model's ladder.
     fn explicit_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
-        self.config.reasoning.or_else(|| {
-            match self.state.read(cx).selected_chat_row() {
-                Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
-                // New chat: the level last used with this model, else the
-                // last-used level overall.
-                None => self
-                    .effective_harness(cx)
-                    .and_then(|h| self.defaults.reasoning_for(h, self.effective_model_id(cx)))
-                    .or(self.defaults.reasoning),
-            }
-        })
+        self.config
+            .reasoning
+            .or_else(|| {
+                match self.state.read(cx).selected_chat_row() {
+                    Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
+                    // New chat: the level last used with this model, else the
+                    // last-used level overall.
+                    None => self
+                        .effective_harness(cx)
+                        .and_then(|h| self.defaults.reasoning_for(h, self.effective_model_id(cx)))
+                        .or(self.defaults.reasoning),
+                }
+            })
+            .or_else(|| {
+                (self.effective_harness(cx) == Some(HarnessId::Antigravity))
+                    .then(|| {
+                        let models = self.models.get(&HarnessId::Antigravity)?.ready()?;
+                        antigravity_saved_variant(models, self.effective_model_id(cx)?)
+                            .map(|(_, level)| level)
+                    })
+                    .flatten()
+            })
     }
 
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
@@ -1166,7 +1195,11 @@ impl Pickers {
         if self.title.is_some() && selected.is_none() {
             return None;
         }
-        selected_catalog_model(models, selected)
+        selected_catalog_model(models, selected).or_else(|| {
+            (harness == HarnessId::Antigravity)
+                .then(|| antigravity_saved_variant(models, selected?).map(|(model, _)| model))
+                .flatten()
+        })
     }
 
     fn model_name(&self, cx: &App) -> ModelName {
@@ -1177,8 +1210,8 @@ impl Pickers {
             return ModelName::Named(label.into());
         }
         // A list still from the previous device is loading for this one.
-        let catalog_loading = self.harnesses_stale
-            || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        let catalog_loading =
+            self.harnesses_stale || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
         let models_loading = self.effective_harness(cx).is_some_and(|harness| {
             !matches!(
                 self.models.get(&harness),
@@ -1759,10 +1792,11 @@ impl Pickers {
             labels.extend(models.iter().map(|m| (m.id.clone(), m.label.clone())));
             self.models.insert(*harness, Loadable::Ready(models));
         }
-        if self
-            .defaults
-            .remember_labels(labels.iter().map(|(id, label)| (id.as_str(), label.as_str())))
-        {
+        if self.defaults.remember_labels(
+            labels
+                .iter()
+                .map(|(id, label)| (id.as_str(), label.as_str())),
+        ) {
             self.save_defaults();
         }
         self.catalog_rev += 1;
@@ -2028,9 +2062,24 @@ impl Pickers {
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
         // Always a concrete selection (no toggle-back-to-default).
+        let normalized = (self.effective_harness(cx) == Some(HarnessId::Antigravity))
+            .then(|| {
+                let models = self.models.get(&HarnessId::Antigravity)?.ready()?;
+                antigravity_saved_variant(models, self.effective_model_id(cx)?)
+                    .map(|(model, _)| model.id.clone())
+            })
+            .flatten();
         if self.state.read(cx).selected_chat.is_some() {
-            self.update_chat_config(cx, move |config| config.reasoning = Some(level));
+            self.update_chat_config(cx, move |config| {
+                if let Some(model) = normalized {
+                    config.model = Some(model);
+                }
+                config.reasoning = Some(level);
+            });
         } else {
+            if let Some(model) = normalized {
+                self.config.model = Some(model);
+            }
             self.config.reasoning = Some(level);
             if let Some(harness) = self.effective_harness(cx) {
                 let model = self.effective_model_id(cx).map(str::to_owned);
@@ -2263,7 +2312,11 @@ impl Pickers {
                 .models
                 .get(&harness)
                 .and_then(Loadable::ready)
-                .is_some_and(|models| !models.iter().any(|m| m.id == id))
+                .is_some_and(|models| {
+                    !models.iter().any(|m| m.id == id)
+                        && !(harness == HarnessId::Antigravity
+                            && antigravity_saved_variant(models, id).is_some())
+                })
             && let Some(descriptor) = descriptors.iter().find(|d| d.id == harness)
         {
             let label = self
@@ -2303,8 +2356,9 @@ impl Pickers {
     /// contain it — then 0), 0 while the list is loading.
     fn selected_model_index(&self, cx: &App) -> usize {
         let selected = self
-            .effective_model_id(cx)
-            .or_else(|| self.selected_model(cx).map(|m| m.id.as_str()));
+            .selected_model(cx)
+            .map(|model| model.id.as_str())
+            .or_else(|| self.effective_model_id(cx));
         let effective = self.effective_harness(cx);
         self.model_rows(cx)
             .iter()
@@ -4990,8 +5044,9 @@ impl Pickers {
     fn row_is_selected(&self, row: &ModelRowData, cx: &App) -> bool {
         Some(row.harness) == self.effective_harness(cx)
             && self
-                .effective_model_id(cx)
-                .or_else(|| self.selected_model(cx).map(|m| m.id.as_str()))
+                .selected_model(cx)
+                .map(|model| model.id.as_str())
+                .or_else(|| self.effective_model_id(cx))
                 == Some(row.model.id.as_str())
     }
 
@@ -6226,8 +6281,8 @@ impl Render for Pickers {
             }
         };
         // A list still from the previous device is loading for this one.
-        let catalog_loading = self.harnesses_stale
-            || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        let catalog_loading =
+            self.harnesses_stale || matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
         // Harness unknown while the catalog resolves: the pixel-glyph loader
         // instead of guessing a brand mark.
         let chip_icon_loading = self.title.is_none()
@@ -6472,6 +6527,63 @@ mod tests {
         let rows = vec![bare_model("first", "First")];
         assert_eq!(selected_catalog_model(&rows, None).unwrap().id, "first");
         assert!(selected_catalog_model(&rows, Some("saved")).is_none());
+    }
+
+    #[test]
+    fn older_antigravity_variant_resolves_to_a_grouped_model_and_effort() {
+        let rows = vec![Model {
+            id: "claude-opus-5-5".into(),
+            label: "Claude Opus 5.5".into(),
+            description: None,
+            reasoning_levels: vec![ReasoningLevel::Low, ReasoningLevel::High],
+            options: vec![],
+        }];
+        let (model, level) = antigravity_saved_variant(&rows, "claude-opus-5-5-high").unwrap();
+        assert_eq!(model.id, "claude-opus-5-5");
+        assert_eq!(level, ReasoningLevel::High);
+        assert!(antigravity_saved_variant(&rows, "claude-opus-5-5-medium").is_none());
+        assert!(selected_catalog_model(&rows, Some("claude-opus-5-5-high")).is_none());
+    }
+
+    #[gpui::test]
+    fn saved_antigravity_variant_uses_grouped_picker_row(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.chats.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "agy-chat", "deviceId": "device", "archived": false,
+                        "createdAt": "2026-09-01T00:00:00Z",
+                        "config": {"harness": "antigravity", "model": "claude-opus-5-5-low", "sandbox": "workspace-write"}
+                    }))
+                    .unwrap(),
+                );
+                state.selected_chat = Some("agy-chat".into());
+                state
+            });
+            let picker = cx.new(|cx| Pickers::new(state, cx));
+            picker.update(cx, |picker, cx| {
+                picker.defaults = ComposerDefaults::default();
+                picker.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Antigravity, "Antigravity")]);
+                picker.apply_model_catalog(
+                    HarnessId::Antigravity,
+                    Loadable::Ready(vec![Model {
+                        id: "claude-opus-5-5".into(),
+                        label: "Claude Opus 5.5".into(),
+                        description: None,
+                        reasoning_levels: vec![ReasoningLevel::Low, ReasoningLevel::High],
+                        options: vec![],
+                    }]),
+                    cx,
+                );
+                assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude-opus-5-5"));
+                assert_eq!(picker.resolved(cx).reasoning, Some(ReasoningLevel::Low));
+                assert_eq!(picker.model_rows(cx).len(), 1);
+                assert!(!picker.model_rows(cx)[0].selected_only);
+                assert!(picker.row_is_selected(&picker.model_rows(cx)[0], cx));
+            });
+        });
     }
 
     fn side_chat_picker(unsaved: bool, cx: &mut App) -> (Entity<AppState>, Entity<Pickers>) {
@@ -7349,7 +7461,9 @@ mod tests {
                 Loadable::Ready(vec![bare_model("gpt", "GPT")]),
                 cx,
             );
-            pickers.models.insert(HarnessId::ClaudeCode, Loadable::Loading);
+            pickers
+                .models
+                .insert(HarnessId::ClaudeCode, Loadable::Loading);
         });
         state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
         cx.run_until_parked();
@@ -8840,7 +8954,10 @@ mod tests {
                 assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude"));
                 picker.show_compact_models(cx);
                 assert_eq!(picker.model_rows_len(cx), 2);
-                assert_eq!(picker.model_rows(cx)[picker.active].harness, HarnessId::ClaudeCode);
+                assert_eq!(
+                    picker.model_rows(cx)[picker.active].harness,
+                    HarnessId::ClaudeCode
+                );
             })
             .unwrap();
     }
@@ -8954,7 +9071,10 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(
                     picker.compact_groups(cx),
-                    vec![(Some(HarnessId::Codex), 0), (Some(HarnessId::ClaudeCode), 2)]
+                    vec![
+                        (Some(HarnessId::Codex), 0),
+                        (Some(HarnessId::ClaudeCode), 2)
+                    ]
                 );
                 picker.toggle_model_favorite(HarnessId::Codex, "gpt-a", cx);
                 assert_eq!(
@@ -8975,9 +9095,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn compact_picker_shares_selection_reset_and_cross_agent_rows(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn compact_picker_shares_selection_reset_and_cross_agent_rows(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             cx.set_global(Theme::dark());
@@ -9015,7 +9133,9 @@ mod tests {
                 assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::Codex);
                 assert_eq!(picker.model_rows(cx)[1].harness, HarnessId::ClaudeCode);
                 // Searching must also find another provider's model.
-                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                picker
+                    .search
+                    .update(cx, |input, cx| input.set_text("Claude", cx));
                 assert_eq!(picker.model_rows_len(cx), 1);
                 assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
                 picker.activate_model_index(0, cx);
@@ -9045,7 +9165,9 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(picker.model_rows_len(cx), 2);
                 assert_eq!(picker.rail_descriptors(cx)[0].id, HarnessId::Codex);
-                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                picker
+                    .search
+                    .update(cx, |input, cx| input.set_text("Claude", cx));
                 assert_eq!(picker.model_rows_len(cx), 1);
                 assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
                 picker.search.update(cx, |input, cx| input.set_text("", cx));
@@ -9085,9 +9207,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn compact_saved_chat_can_pick_a_model_from_another_agent(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn compact_saved_chat_can_pick_a_model_from_another_agent(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             cx.set_global(Theme::dark());
@@ -9098,17 +9218,20 @@ mod tests {
         let handle = cx.add_window(|_, cx| {
             let state = cx.new(|_| {
                 let mut state = AppState::new();
-                state.chats.push(serde_json::from_value(serde_json::json!({
-                    "id": "saved-chat",
-                    "deviceId": "local",
-                    "archived": false,
-                    "createdAt": "2026-10-07T00:00:00Z",
-                    "config": {
-                        "harness": "codex",
-                        "model": "codex-model",
-                        "sandbox": "workspace-write"
-                    }
-                })).unwrap());
+                state.chats.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "saved-chat",
+                        "deviceId": "local",
+                        "archived": false,
+                        "createdAt": "2026-10-07T00:00:00Z",
+                        "config": {
+                            "harness": "codex",
+                            "model": "codex-model",
+                            "sandbox": "workspace-write"
+                        }
+                    }))
+                    .unwrap(),
+                );
                 state.selected_chat = Some("saved-chat".into());
                 state
             });
@@ -9133,7 +9256,9 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(picker.model_rail, ModelRail::All);
                 assert_eq!(picker.model_rows_len(cx), 2);
-                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                picker
+                    .search
+                    .update(cx, |input, cx| input.set_text("Claude", cx));
                 assert_eq!(picker.model_rows_len(cx), 1);
                 picker.activate_model_index(0, cx);
                 let state = picker.state.read(cx);

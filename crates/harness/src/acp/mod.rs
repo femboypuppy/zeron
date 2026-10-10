@@ -3261,7 +3261,7 @@ fn effort_groups<'a>(
 
 /// fold effort variants into one row whose ladder lists the levels offered;
 /// models without a level in their name pass through.
-fn group_effort_variants(models: Vec<Model>) -> Vec<Model> {
+pub(crate) fn group_effort_variants(models: Vec<Model>) -> Vec<Model> {
     let groups = effort_groups(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
     groups
         .iter()
@@ -3280,6 +3280,44 @@ fn group_effort_variants(models: Vec<Model>) -> Vec<Model> {
             })
         })
         .collect()
+}
+
+pub(crate) fn grouped_effort_variant(
+    models: &[Model],
+    requested: &str,
+    reasoning: Option<ReasoningLevel>,
+) -> Option<String> {
+    let groups = effort_groups(
+        models
+            .iter()
+            .map(|model| (model.id.as_str(), model.label.as_str())),
+    );
+    let group = groups.iter().find(|group| {
+        !group.variants.is_empty()
+            && (group.id == requested || group.variants.iter().any(|(_, id)| *id == requested))
+    })?;
+    reasoning
+        .and_then(|level| {
+            group
+                .variants
+                .iter()
+                .find(|(offered, _)| *offered == level)
+                .map(|(_, id)| (*id).to_owned())
+        })
+        .or_else(|| {
+            group
+                .variants
+                .iter()
+                .find(|(_, id)| *id == requested)
+                .map(|(_, id)| (*id).to_owned())
+        })
+        .or_else(|| {
+            group
+                .variants
+                .iter()
+                .max_by_key(|(level, _)| *level)
+                .map(|(_, id)| (*id).to_owned())
+        })
 }
 
 /// the advertised variant id for a grouped model: the picked level when the

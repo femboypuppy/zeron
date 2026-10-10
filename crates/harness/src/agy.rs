@@ -141,6 +141,9 @@ fn selected_model(
     available: &[Model],
 ) -> Option<String> {
     let requested = requested?;
+    if let Some(variant) = crate::acp::grouped_effort_variant(available, requested, reasoning) {
+        return Some(variant);
+    }
     let level = reasoning.map(effort);
     let base = model_base(requested);
     if base != requested && available.iter().any(|model| model.id == requested) {
@@ -210,7 +213,9 @@ impl Harness for AgyCliHarness {
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        self.available_models().await
+        self.available_models()
+            .await
+            .map(crate::acp::group_effort_variants)
     }
 
     async fn run(
@@ -524,6 +529,49 @@ mod tests {
     }
 
     #[test]
+    fn groups_cli_effort_variants_for_the_picker() {
+        let models = parse_models(
+            "claude-opus-5-5-low\tClaude Opus 5.5 (Low)\nclaude-opus-5-5-medium\tClaude Opus 5.5 (Medium)\nclaude-opus-5-5-high\tClaude Opus 5.5 (High)\ngemini-3.1-pro-low\tGemini 3.1 Pro (Low)\ngemini-3.1-pro-high\tGemini 3.1 Pro (High)\ngpt-oss-120b-medium\tGPT OSS 120B (Medium)\n",
+        );
+        let grouped = crate::acp::group_effort_variants(models.clone());
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped[0].id, "claude-opus-5-5");
+        assert_eq!(grouped[0].label, "Claude Opus 5.5");
+        assert_eq!(
+            grouped[0].reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+            ]
+        );
+        assert_eq!(
+            grouped[1].reasoning_levels,
+            vec![ReasoningLevel::Low, ReasoningLevel::High]
+        );
+        assert_eq!(grouped[2].reasoning_levels, vec![ReasoningLevel::Medium]);
+        assert_eq!(
+            selected_model(Some(&grouped[0].id), Some(ReasoningLevel::Medium), &models),
+            Some("claude-opus-5-5-medium".into())
+        );
+        assert_eq!(
+            selected_model(
+                Some("claude-opus-5-5-low"),
+                Some(ReasoningLevel::High),
+                &models
+            ),
+            Some("claude-opus-5-5-high".into())
+        );
+        let aliased = parse_models(
+            "gemini-3.1-pro-low\tGemini 3.1 Pro (Low)\ngemini-pro-agent\tGemini 3.1 Pro (High)\n",
+        );
+        assert_eq!(
+            selected_model(Some("gemini-3.1-pro"), Some(ReasoningLevel::High), &aliased),
+            Some("gemini-pro-agent".into())
+        );
+    }
+
+    #[test]
     fn maps_existing_acp_model_to_a_cli_variant() {
         let models = parse_models(
             "gemini-3.7-flash-high\tGemini 3.7 Flash (High)\ngemini-3.7-flash-low\tGemini 3.7 Flash (Low)\n",
@@ -538,7 +586,7 @@ mod tests {
                 Some(ReasoningLevel::High),
                 &models
             ),
-            Some("gemini-3.7-flash-low".into())
+            Some("gemini-3.7-flash-high".into())
         );
         assert_eq!(
             session_id("conversation-1"),

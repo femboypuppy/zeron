@@ -168,7 +168,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
-    (HarnessId::Antigravity, "Antigravity", "Antigravity"),
+    (HarnessId::Antigravity, "Antigravity", "agy"),
     (HarnessId::Grok, "Grok", "grok login"),
     (HarnessId::Devin, "Devin", "devin auth login"),
     (HarnessId::Opencode, "OpenCode", "opencode auth login"),
@@ -214,6 +214,9 @@ pub fn switches_accounts(harness: HarnessId) -> bool {
 /// its entries. Pure.
 pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
     match harness {
+        HarnessId::Antigravity => Some(
+            "The agy CLI keeps one live account. Run `agy` to sign in, or use `/logout` inside it to sign out, then Refresh here. Zeren cannot switch separate Antigravity accounts.",
+        ),
         HarnessId::Hermes => Some(
             "Hermes manages its own credential pool and rotates through it. Accounts added \
              here go through `hermes auth add`; remove one with `hermes auth remove`.",
@@ -257,6 +260,9 @@ pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
 
 /// The list's last row: connect the first account, or add another. Pure.
 pub fn add_account_label(harness: HarnessId, empty: bool) -> String {
+    if harness == HarnessId::Antigravity {
+        return "Open agy to sign in".to_string();
+    }
     if empty {
         format!("Connect a {} account", provider_name(harness))
     } else {
@@ -863,6 +869,33 @@ impl AccountsPage {
         cx.notify();
     }
 
+    fn open_antigravity_cli(&mut self, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+            let result = zeren_harness::AgyCliHarness::new()
+                .resolve_executable()
+                .map_err(|error| error.to_string())
+                .and_then(|executable| {
+                    std::process::Command::new(executable)
+                        .creation_flags(CREATE_NEW_CONSOLE)
+                        .spawn()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = result {
+                self.error = Some(format!("Couldn't open agy: {error}").into());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.error = Some("Open a terminal and run `agy` to manage its login.".into());
+        }
+        cx.notify();
+    }
+
     /// Fold a StartAgentLogin reply into the flow `attempt` (if still open).
     fn apply_start(
         &mut self,
@@ -1259,6 +1292,9 @@ impl AccountsPage {
             );
 
         let menu_open = self.row_menu.get() == Some(&account.id);
+        let can_manage_agy = cfg!(windows)
+            && self.target_device.is_none()
+            && account.harness == HarnessId::Antigravity;
         let menu_account = account.clone();
         let menu_trigger_id = account.id.clone();
         let mut more = widgets::action_button(theme, widgets::ActionTone::Quiet)
@@ -1334,6 +1370,17 @@ impl AccountsPage {
                             .child(SharedString::from("Remove account")),
                     )
                 })
+                .when(can_manage_agy, |menu| {
+                    menu.child(
+                        popover::menu_row(&popup, false, format!("account-menu-agy-{ix}"))
+                            .id(("account-menu-agy", ix))
+                            .on_click(cx.listener(|page, _, _, cx| {
+                                page.close_row_menu(cx);
+                                page.open_antigravity_cli(cx);
+                            }))
+                            .child(SharedString::from("Open agy to sign out")),
+                    )
+                })
                 .into_any_element();
             more = more.relative().child(popover::anchored_menu_below_end(
                 format!("account-menu-{ix}"),
@@ -1341,9 +1388,8 @@ impl AccountsPage {
                 self.row_menu.closing_since(),
             ));
         }
-        // Accounts with nothing to offer (an unreadable live login,
-        // Antigravity's single login) keep the slot for alignment only.
-        let has_actions = account.switchable;
+        // Accounts with nothing to offer keep the slot for alignment only.
+        let has_actions = account.switchable || can_manage_agy;
 
         let body = div()
             .id(("account-row", ix))
@@ -2028,14 +2074,17 @@ impl Render for AccountsPage {
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
                         let empty = rows.is_empty();
-                        let can_add = empty || !keeps_one_login(harness);
+                        let can_add = (harness != HarnessId::Antigravity
+                            || self.target_device.is_none())
+                            && (empty || !keeps_one_login(harness));
                         let card = widgets::section_card(&theme).mt(px(8.0));
                         let empty_copy = match harness {
-                            // Cursor's app login is SEPARATE from `cursor-agent
-                            // login` — pointing at the CLI would send users to a
-                            // sign-in that does not light this up. Antigravity
-                            // has no CLI login at all.
-                            HarnessId::Cursor | HarnessId::Antigravity => format!(
+                            HarnessId::Antigravity => {
+                                "No native agy login detected. Open agy to sign in, then Refresh."
+                                    .to_string()
+                            }
+                            // Cursor's app login is separate from `cursor-agent login`.
+                            HarnessId::Cursor => format!(
                                 "{name} isn't connected on this device — connect it to run \
                                  {name} sessions."
                             ),
@@ -2097,11 +2146,16 @@ impl Render for AccountsPage {
                                                         })
                                                         .on_click(cx.listener(
                                                             move |this, _, _, cx| {
-                                                                this.start_login(
-                                                                    harness,
-                                                                    option.provider,
-                                                                    cx,
-                                                                );
+                                                                if harness == HarnessId::Antigravity
+                                                                {
+                                                                    this.open_antigravity_cli(cx);
+                                                                } else {
+                                                                    this.start_login(
+                                                                        harness,
+                                                                        option.provider,
+                                                                        cx,
+                                                                    );
+                                                                }
                                                             },
                                                         ))
                                                         .child(
@@ -2332,7 +2386,7 @@ mod tests {
         }
         assert_eq!(
             add_account_label(HarnessId::Antigravity, true),
-            "Connect a Antigravity account"
+            "Open agy to sign in"
         );
         // Every agent with a login of its own has an Accounts section.
         for harness in [HarnessId::Opencode, HarnessId::Pi, HarnessId::Hermes] {
@@ -2350,6 +2404,7 @@ mod tests {
         // Hermes rotates its own pool; zeren never switches it, and says so.
         assert!(!switches_accounts(HarnessId::Hermes) && switches_accounts(HarnessId::Grok));
         assert!(provider_note(HarnessId::Hermes).is_some_and(|n| n.contains("hermes auth add")));
+        assert!(provider_note(HarnessId::Antigravity).is_some_and(|n| n.contains("/logout")));
         assert!(provider_note(HarnessId::Grok).is_none());
     }
 
